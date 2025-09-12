@@ -1,0 +1,10 @@
+python-dotenv
+openai
+pdfminer.six
+reportlab
+pillow
+imageio-ffmpeg
+pydub
+audioop-lts
+requests
+google-generativeai

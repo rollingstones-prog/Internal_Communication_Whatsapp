@@ -1,5 +1,6 @@
 # --- ElevenLabs API Integration ---
 from elevenlabs_api import tts_to_mp3 , stt_from_mp3
+from fastapi import FastAPI
 # WhatsApp Lead Agent Bot (Single File)
 #
 # SETUP NOTES:
@@ -39,6 +40,7 @@ import os
 import warnings
 
 
+
 # --- Standard Library Imports ---
 import json
 import http.server
@@ -73,7 +75,7 @@ PHRASES = {
     "done_ack": "Update note kar liya. Shukriya.",
     "delay_ack": "Delay note kar liya hai."
 }
-
+app = FastAPI()
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
 print(WA_TOKEN)
@@ -2409,4 +2411,5 @@ def main():
         httpd.serve_forever()
 
 if __name__ == "__main__":
+
     main()

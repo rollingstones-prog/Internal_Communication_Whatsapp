@@ -52,7 +52,6 @@ from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
 from dashboard_api import app as dashboard_app
-from dashboard_api import router
 
 
 # --- Third-party Imports ---
@@ -98,8 +97,8 @@ PHRASES = {
     "done_ack": "Update note kar liya. Shukriya.",
     "delay_ack": "Delay note kar liya hai."
 }
-app = FastAPI()
-app.include_router(router)
+# app = FastAPI()
+# app.include_router(router)
 app = dashboard_app
 
 # Environment Variables
@@ -2439,6 +2438,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 

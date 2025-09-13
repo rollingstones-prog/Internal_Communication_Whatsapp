@@ -65,6 +65,26 @@ import io
 import time
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+
+# Writable data directory for Render (ephemeral storage)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/opt/render/project/tmp"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Paths for storage
+EVENTS_FILE = DATA_DIR / "events.jsonl"
+REPORTS_DIR = DATA_DIR / "reports"
+UPLOAD_DIR = DATA_DIR / "uploads"
+REPORTS_OUT_DIR = DATA_DIR / "reports_out"
+
+# Ensure directories exist
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ensure events file exists
+if not EVENTS_FILE.exists():
+    EVENTS_FILE.touch()
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
@@ -2413,3 +2433,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+

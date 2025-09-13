@@ -1,6 +1,7 @@
 # --- ElevenLabs API Integration ---
 from elevenlabs_api import tts_to_mp3 , stt_from_mp3
 from fastapi import FastAPI
+
 # WhatsApp Lead Agent Bot (Single File)
 #
 # SETUP NOTES:
@@ -98,6 +99,17 @@ PHRASES = {
 }
 app = FastAPI()
 app.include_router(router)
+
+# --- Enable CORS ---
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # Ya specific: ["http://127.0.0.1:5500"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Environment Variables
@@ -2437,6 +2449,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 

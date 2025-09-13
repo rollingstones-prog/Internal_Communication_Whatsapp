@@ -51,6 +51,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
+from dashboard_api import app as dashboard_app
+
 
 # --- Third-party Imports ---
 import requests
@@ -96,6 +98,8 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 app = FastAPI()
+app = dashboard_app
+
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
 print(WA_TOKEN)
@@ -2433,4 +2437,5 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 

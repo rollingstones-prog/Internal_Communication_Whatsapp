@@ -1,0 +1,59 @@
+{
+  "thread_id": "923212558027",
+  "name": "Hafiz",
+  "messages": [
+    {
+      "from": "Boss",
+      "header": "BOSS -> EMPLOYEE (forwarded instruction)",
+      "type": "text",
+      "text": "yaha aj ki sari detailbhej asharoib ye msgs meh data save shai kro isisliye krha hu oay ?  serious nh lena",
+      "ts": "2025-09-14T12:26:17.525346"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE -> UPDATE",
+      "type": "text",
+      "text": "Aj Ai Whatsap Bot meh apka number add krdia hy as an operator you can send msgs To bot .By this Command @working <Name> | Msg.....\n\nBut there's a One Issue Which is reporting employee ki report Text ki forward huri hy But Pdf/Image Forward nh huri \nBaki Analysis Well hy Both Side se  \n\n\n\nAi Call Center setup ka Stack Change krne ka bola Exotel A",
+      "ts": "2025-09-14T12:26:42.720071"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE -> BOSS (document)",
+      "type": "text",
+      "text": "Bulk-Messaging-and-AI-Automation-Proposal-Car-Transportation-Business-USA.pdf",
+      "ts": "2025-09-14T12:26:54.561257"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE_MEDIA",
+      "type": "document",
+      "filename": "doc_20250914_122645.pdf",
+      "media_id": "1699115547456921",
+      "local_path": "media\\Hafiz\\2025-09-14\\doc_20250914_122645.pdf",
+      "ts": "2025-09-14T12:26:54.571659"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE -> BOSS (image)",
+      "type": "text",
+      "text": "image_20250914_122657.jpg",
+      "ts": "2025-09-14T12:27:03.636231"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE_MEDIA",
+      "type": "image",
+      "filename": "image_20250914_122657.jpg",
+      "media_id": "4210200929199149",
+      "local_path": "media\\Hafiz\\2025-09-14\\image_20250914_122657.jpg",
+      "ts": "2025-09-14T12:27:03.646097"
+    },
+    {
+      "from": "Boss",
+      "header": "BOSS -> EMPLOYEE (forwarded instruction)",
+      "type": "text",
+      "text": ".",
+      "ts": "2025-09-14T12:44:15.031690"
+    }
+  ]
+}

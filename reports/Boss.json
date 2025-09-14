@@ -1,0 +1,22 @@
+{
+  "thread_id": "Boss",
+  "name": "Boss",
+  "messages": [
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE -> BOSS (document)",
+      "type": "text",
+      "text": "PAK TOWER 2 RAHEEL 8-10-2025 RAHEEL CALLING SHEET.pdf",
+      "ts": "2025-09-11T14:33:19.365965"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE_MEDIA",
+      "type": "document",
+      "filename": "doc_20250911_143314.pdf",
+      "media_id": "684285043959488",
+      "local_path": "media\\Boss\\2025-09-11\\doc_20250911_143314.pdf",
+      "ts": "2025-09-11T14:33:19.374987"
+    }
+  ]
+}

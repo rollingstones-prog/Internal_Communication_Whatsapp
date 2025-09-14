@@ -33,7 +33,7 @@
   },
   "Arif": {
     "msisdn": "923472491805",
-    "pref": "auto"
+    "pref": "voice"
   },
   "Rsc": {
     "msisdn": "923182986046",
@@ -65,19 +65,19 @@
   },
   "Fahad": {
     "msisdn": "923463248880",
-    "pref": "auto"
+    "pref": "text"
   },
   "Shahzaib": {
     "msisdn": "923070251847",
     "pref": "auto"
   },
-  
   "Ceo": {
     "msisdn": "923333848611",
     "pref": "auto"
   },
-   "Master Agent": {
-    "msisdn": "923239291135",
+  "Waqas": {
+    "msisdn": "923128289457",
     "pref": "auto"
   }
+
 }

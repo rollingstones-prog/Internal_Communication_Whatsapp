@@ -1,6 +1,8 @@
 # --- ElevenLabs API Integration ---
 from dashboard_api import find_employee_name_by_msisdn
 from elevenlabs_api import tts_to_mp3 , stt_from_mp3
+from supabase import create_client
+
 # WhatsApp Lead Agent Bot (Single File)
 #
 # SETUP NOTES:
@@ -86,6 +88,10 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
 DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 try:
     FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
 except ValueError:
@@ -610,8 +616,16 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
             "to": to_msisdn,
             "payload": {"text": {"body": text}, "type": "text"}
         }
-        append_jsonl(STORAGE_PATHS["events"], record)
+        def append_event(record: dict):
+            try:
+                # record["at"] = now_iso()   ❌ temporarily hata do
+                supabase.table("events").insert(record).execute()
+                print("✅ Event saved in Supabase")
+            except Exception as e:
+                print(f"❌ Supabase insert error: {e}")
 
+
+        append_event(record)
         if resp.status_code >= 400:
             handle_whatsapp_error(data, to_msisdn)  # ALWAYS dict-like
         return data
@@ -2274,14 +2288,20 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path)
         query = parse_qs(parsed_path.query)
-        
+
         if parsed_path.path == "/webhook":
-            if ('hub.mode' in query and 'hub.verify_token' in query and
-                    query['hub.mode'][0] == 'subscribe' and
-                    query['hub.verify_token'][0] == VERIFY_TOKEN):
+            if (
+                "hub.mode" in query
+                and "hub.verify_token" in query
+                and query["hub.mode"][0] == "subscribe"
+                and query["hub.verify_token"][0] == VERIFY_TOKEN
+            ):
+                challenge = query["hub.challenge"][0]
+                print(f"Webhook verified! challenge={challenge}")
                 self.send_response(200)
+                self.send_header("Content-type", "text/plain")
                 self.end_headers()
-                self.wfile.write(query['hub.challenge'][0].encode())
+                self.wfile.write(challenge.encode("utf-8"))  # ✅ Meta ko exact challenge chahiye
             else:
                 self.send_response(403)
                 self.end_headers()
@@ -2291,38 +2311,30 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/webhook":
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers.get("Content-Length", 0))
             post_data = self.rfile.read(content_length)
-            data = json.loads(post_data)
+            try:
+                data = json.loads(post_data)
+            except Exception:
+                data = {}
 
-            # extract wa_id from incoming message
-            wa_id = None
-            emp_name = None
-            if "entry" in data:
-                for entry in data["entry"]:
-                    for change in entry.get("changes", []):
-                        value = change.get("value", {})
-                        contacts = value.get("contacts", [])
-                        for c in contacts:
-                            wa_id = c.get("wa_id")
-                            emp_name = find_employee_name_by_msisdn(wa_id)
-
-            # log event
+            # Always log raw payload for debugging
             append_jsonl(STORAGE_PATHS["events"], {
-                "kind": "WA_RECV",
-                "employee": emp_name,
-                "msisdn": wa_id,
+                "kind": "WA_RECV_RAW",
                 "payload": data,
                 "timestamp": now_iso()
             })
 
-            # normal processing of messages
-            if 'entry' in data and data['entry']:
-                for entry in data['entry']:
-                    for change in entry.get('changes', []):
-                        if 'messages' in change.get('value', {}):
-                            for message in change['value']['messages']:
-                                self.process_message(message)
+            if "entry" in data:
+                for entry in data["entry"]:
+                    for change in entry.get("changes", []):
+                        value = change.get("value", {})
+                        if "messages" in value:
+                            for message in value["messages"]:
+                                try:
+                                    self.process_message(message, value)
+                                except Exception as e:
+                                    print("Process error:", e)
 
             self.send_response(200)
             self.end_headers()
@@ -2330,117 +2342,82 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def process_message(self, message):
-        from_msisdn = message.get('from')
-        msg_type = message.get('type')
-        msg_id = message.get('id')
+    def process_message(self, message, value):
+        from_msisdn = message.get("from")
+        msg_type = message.get("type")
+        msg_id = message.get("id")
 
-        # Debug logging
-        print(f"Message from {from_msisdn}, type: {msg_type}")
+        print(f"📩 Message from {from_msisdn}, type={msg_type}")
 
-        # Check for duplicate messages
+        # Debounce check
         if msg_id and is_message_seen(msg_id):
-            print("Duplicate message detected, skipping")
+            print("Duplicate message, skipping")
             return
-        
-        # Mark message as seen
         if msg_id:
             save_seen_message_id(msg_id)
 
         employees = load_employees()
-        sender_name = None
-        sender_info = None
+        sender_name, sender_info = None, None
         for name, info in employees.items():
             if info["msisdn"] == from_msisdn:
-                sender_name = name
-                sender_info = info
+                sender_name, sender_info = name, info
                 break
+
         is_boss = (from_msisdn == BOSS_WA_ID)
 
+        # === Employee message ===
         if not is_boss and sender_name:
-            # Always notify boss with mapped name and number
-            
-            # Confirm to employee
-            whatsapp_send_text(from_msisdn, f" {sender_name}, aapka message receive ho gaya hai..")
-            # Proceed with employee message handling
-            if msg_type == 'text':
-                text = message['text']['body']
-                handle_employee_message(text, from_msisdn, sender_name)
-            elif msg_type in ['image', 'document', 'audio', 'voice']:
-                if msg_type == 'voice':
-                    msg_type = 'audio'
-                medi_id = message[msg_type]['id']
-                mime_type = message[msg_type].get('mime_type')
-                filename = message[msg_type].get('filename')
+            # ✅ Log WA_RECV event (Employee → Agent)
+            record = {
+                "kind": "WA_RECV",
+                "employee": sender_name,
+                "msisdn": from_msisdn,
+                "at": now_iso(),
+                "payload": value  # full payload for reference
+            }
+            def append_event(record: dict):
+                try:
+                    # record["at"] = now_iso()   ❌ temporarily hata do
+                    supabase.table("events").insert(record).execute()
+                    print("✅ Event saved in Supabase")
+                except Exception as e:
+                    print(f"❌ Supabase insert error: {e}")
+
+
+            # Acknowledge to employee
+            whatsapp_send_text(from_msisdn, f"{sender_name}, aapka message receive ho gaya hai ✅")
+
+            # Handle text vs media
+            if msg_type == "text":
+                handle_employee_message(message["text"]["body"], from_msisdn, sender_name)
+            elif msg_type in ["image", "document", "audio", "voice"]:
+                if msg_type == "voice":
+                    msg_type = "audio"
+                medi_id = message[msg_type]["id"]
+                mime_type = message[msg_type].get("mime_type")
+                filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
             return
 
+        # === Unknown employee ===
         if not is_boss and not sender_name:
-            # Unknown sender, ask for clarification
-            whatsapp_send_text(BOSS_WA_ID, f"Unknown sender {from_msisdn}. Please map this number to a name for best experience.")
-            whatsapp_send_text(from_msisdn, "Aapka number system me map nahi hai. Meharbani se apna naam confirm karein.")
+            whatsapp_send_text(BOSS_WA_ID, f"⚠️ Unknown sender: {from_msisdn}")
+            whatsapp_send_text(from_msisdn, "Aap system me map nahi hain. Meharbani apna naam batayein.")
             return
 
+        # === Boss message ===
         if is_boss:
-            if msg_type == 'text':
-                text = message['text']['body']
-                handle_boss_command(text, from_msisdn)
-                voice_arm_state = get_voice_arm_state()
-                if voice_arm_state.get("armed"):
+            if msg_type == "text":
+                handle_boss_command(message["text"]["body"], from_msisdn)
+                if get_voice_arm_state().get("armed"):
                     set_voice_arm_state(False)
-            elif msg_type in ['image', 'document', 'audio', 'voice']:
-                if msg_type == 'voice':
-                    msg_type = 'audio'
-                medi_id = message[msg_type]['id']
-                mime_type = message[msg_type].get('mime_type')
-                filename = message[msg_type].get('filename')
+            elif msg_type in ["image", "document", "audio", "voice"]:
+                if msg_type == "voice":
+                    msg_type = "audio"
+                medi_id = message[msg_type]["id"]
+                mime_type = message[msg_type].get("mime_type")
+                filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
-        elif msg_type in ['image', 'document', 'audio', 'voice']:
-            # Normalize voice/audio types
-            if msg_type == 'voice':
-                msg_type = 'audio'  # Treat voice as audio for processing
-            
-            medi_id = message[msg_type]['id']
-            mime_type = message[msg_type].get('mime_type')
-            filename = message[msg_type].get('filename')
-            handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
-            
-            # Check if boss sent audio and voice arm is active
-            if is_boss and msg_type == 'audio':
-                voice_arm_state = get_voice_arm_state()
-                if voice_arm_state.get("armed") and voice_arm_state.get("targets"):
-                    # Download the audio first
-                    date_str = datetime.now().strftime("%Y-%m-%d")
-                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    media_dir = STORAGE_PATHS["media"] / "boss" / date_str
-                    file_path = wa_download_media(medi_id, media_dir / f"boss_audio_{ts_str}.ogg")
-                    
-                    if file_path:
-                        targets = voice_arm_state["targets"]
-                        sent_names = []
-                        skip_names = []
-                        
-                        for target_name in targets:
-                            if target_name in employees:
-                                result = wa_send_audio(employees[target_name]["msisdn"], file_path, mark_as_voice=True)
-                                if result["ok"]:
-                                    sent_names.append(target_name)
-                                else:
-                                    skip_names.append(f"{target_name} (send fail)")
-                            else:
-                                skip_names.append(f"{target_name} (map nahi mila)")
-                        
-                        # Send confirmation and disarm
-                        if sent_names:
-                            whatsapp_send_text(from_msisdn, f"Voice routing OFF. Bhej diya: {', '.join(sent_names)}.")
-                        
-                        if skip_names:
-                            whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
-                        
-                        set_voice_arm_state(False)
-                    else:
-                        whatsapp_send_text(from_msisdn, "Voice routing fail. Audio download nahi hua.")
-                        set_voice_arm_state(False)
 
 
 
@@ -2465,5 +2442,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

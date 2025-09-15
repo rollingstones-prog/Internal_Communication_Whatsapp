@@ -64,7 +64,12 @@ EVENTS_FILE = Path("./events.jsonl")
 REPORTS_DIR = Path("./reports")
 UPLOAD_DIR = Path("./uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+# Load env vars
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # -------------------
 # ElevenLabs API Setup
 # -------------------
@@ -294,4 +299,5 @@ async def upload_file(file: UploadFile = File(...)):
     supabase.table("events").insert(record).execute()
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+
 

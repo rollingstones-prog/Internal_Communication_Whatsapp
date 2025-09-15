@@ -53,6 +53,8 @@ from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from dashboard_api import app as dashboard_app 
 
 
 
@@ -75,7 +77,17 @@ PORT = 8000
 HOST = "0.0.0.0"
 
 app = FastAPI()
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# Mount all routes from dashboard_api
+app.mount("", dashboard_app)  
 # Professional Roman-Urdu Phrases
 PHRASES = {
     "emp_ack": "Update receive ho gaya. Shukriya.",
@@ -2448,4 +2460,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

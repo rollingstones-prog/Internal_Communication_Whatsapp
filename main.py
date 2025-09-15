@@ -52,12 +52,6 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from dashboard_api import app as dashboard_app 
-
-
-
 
 # --- Third-party Imports ---
 import requests
@@ -76,18 +70,6 @@ load_dotenv(override=True)
 PORT = 8000
 HOST = "0.0.0.0"
 
-app = FastAPI()
-# CORS setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Mount all routes from dashboard_api
-app.mount("", dashboard_app)  
 # Professional Roman-Urdu Phrases
 PHRASES = {
     "emp_ack": "Update receive ho gaya. Shukriya.",
@@ -634,14 +616,8 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
             "to": to_msisdn,
             "payload": {"text": {"body": text}, "type": "text"}
         }
-        def append_event(record: dict):
-            try:
-                # record["at"] = now_iso()   ❌ temporarily hata do
-                supabase.table("events").insert(record).execute()
-                print("✅ Event saved in Supabase")
-            except Exception as e:
-                print(f"❌ Supabase insert error: {e}")
 
+        
 
         append_event(record)
         if resp.status_code >= 400:
@@ -2300,6 +2276,14 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
     # Send ack to employee only
     if ack_msg:
         whatsapp_send_text(from_msisdn, ack_msg)
+# 🌍 Global append_event function
+def append_event(record: dict):
+    print("👉 append_event called with:", record)   # Debug
+    try:
+        resp = supabase.table("events").insert(record).execute()
+        print("👉 Supabase response:", resp)
+    except Exception as e:
+        print(f"❌ Supabase insert error: {e}")
 
 # --- HTTP Server ---
 class WebhookHandler(http.server.BaseHTTPRequestHandler):
@@ -2384,28 +2368,24 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         is_boss = (from_msisdn == BOSS_WA_ID)
 
         # === Employee message ===
+        # === Employee message ===
         if not is_boss and sender_name:
-            # ✅ Log WA_RECV event (Employee → Agent)
+            # ✅ Save WA_RECV in Supabase
             record = {
                 "kind": "WA_RECV",
-                "employee": sender_name,
+                "employee": sender_name or "Unknown",
                 "msisdn": from_msisdn,
+                "to": BOSS_WA_ID,             # Boss ka WA ID hamesha bharo
                 "at": now_iso(),
-                "payload": value  # full payload for reference
+                "payload": message            # full WhatsApp JSON
             }
-            def append_event(record: dict):
-                try:
-                    # record["at"] = now_iso()   ❌ temporarily hata do
-                    supabase.table("events").insert(record).execute()
-                    print("✅ Event saved in Supabase")
-                except Exception as e:
-                    print(f"❌ Supabase insert error: {e}")
+            append_event(record)
+            print(record)
 
-
-            # Acknowledge to employee
+            # ✅ Acknowledge to employee
             whatsapp_send_text(from_msisdn, f"{sender_name}, aapka message receive ho gaya hai ✅")
 
-            # Handle text vs media
+            # ✅ Handle text vs media
             if msg_type == "text":
                 handle_employee_message(message["text"]["body"], from_msisdn, sender_name)
             elif msg_type in ["image", "document", "audio", "voice"]:

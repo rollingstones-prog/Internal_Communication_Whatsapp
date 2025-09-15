@@ -52,6 +52,10 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
+from fastapi import FastAPI
+
+
+
 
 # --- Third-party Imports ---
 import requests
@@ -69,6 +73,8 @@ load_dotenv(override=True)
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
+
+app = FastAPI()
 
 # Professional Roman-Urdu Phrases
 PHRASES = {
@@ -2442,3 +2448,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

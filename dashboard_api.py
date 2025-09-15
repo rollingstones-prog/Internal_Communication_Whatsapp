@@ -1,3 +1,5 @@
+import subprocess
+import tempfile
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
@@ -6,8 +8,13 @@ import json
 import os
 import requests
 from dotenv import load_dotenv
+from supabase import create_client
+import os
+import supabase
+from utils import now_iso
 
-from utils import append_jsonl, read_jsonl
+
+
 
 # -------------------
 # Init FastAPI
@@ -42,6 +49,13 @@ def find_employee_name_by_msisdn(msisdn: str):
         if info.get("msisdn") == msisdn:
             return name
     return msisdn
+def read_events(limit=200):
+    try:
+        resp = supabase.table("events").select("*").order("at", desc=True).limit(limit).execute()
+        return resp.data or []
+    except Exception as e:
+        print(f"❌ Supabase read error: {e}")
+        return []
 
 # -------------------
 # Files & Directories
@@ -77,20 +91,46 @@ def tts_to_mp3(text, out_path, voice_id=ELEVENLABS_VOICE_ID):
 
 
 def stt_from_audio(audio_path: Path):
+    """
+    Transcribe audio using ElevenLabs STT.
+    Supports MP3/OGG/OPUS/WAV (auto convert with ffmpeg if needed).
+    """
+    ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
     headers = {"xi-api-key": ELEVENLABS_API_KEY}
+
     try:
-        with open(audio_path, "rb") as f:
-            files = {"audio": f}
-            resp = requests.post(ELEVENLABS_STT_URL, headers=headers, files=files, timeout=60)
+        audio_path = Path(audio_path)
+
+        # Agar file ogg/opus/wav hai to ffmpeg se mp3 bana lo
+        use_path = audio_path
+        if audio_path.suffix.lower() in [".ogg", ".opus", ".wav"]:
+            out_path = Path(tempfile.gettempdir()) / (audio_path.stem + ".mp3")
+            cmd = ["ffmpeg", "-y", "-i", str(audio_path), str(out_path)]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            use_path = out_path
+
+        with open(use_path, "rb") as f:
+            files = {"file": f}                # 👈 correct field
+            data = {"model_id": "scribe_v1"}   # 👈 valid model
+            resp = requests.post(ELEVENLABS_STT_URL, headers=headers, data=data, files=files, timeout=60)
+
         if resp.status_code == 200:
-            return resp.json().get("text", "")
-        return ""
+            result = resp.json()
+            return result.get("text", "").strip()
+        else:
+            print("❌ ElevenLabs STT error:", resp.status_code, resp.text)
+            return "Audio transcription me temporary issue hai."
+
     except Exception as e:
-        print("STT error:", e)
-        return ""
+        print("❌ ElevenLabs STT exception:", str(e))
+        return "Audio transcription me temporary issue hai."
+
 @app.get("/chats/all")
 def get_all_chats():
-    events = read_jsonl(EVENTS_FILE)
+    events = read_events()
+    
     employees = {}
     for e in events:
         entries = e.get("payload", {}).get("entry", [])
@@ -117,7 +157,9 @@ def get_all_chats():
                         "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={mapped_name}",
                         "online": True
                     }
-    return {"employees": list(employees.values())}
+                    
+
+    return { "events": events, "employees": list(employees.values())}
 
 
 
@@ -131,7 +173,7 @@ def find_employee_name_by_msisdn(msisdn: str):
 
 @app.get("/chats/{employee}")
 def get_employee_chat(employee: str):
-    events = read_jsonl(EVENTS_FILE)
+    events = read_events()
     chat = []
 
     for e in events:
@@ -147,23 +189,46 @@ def get_employee_chat(employee: str):
 
         # ✅ Employee → Agent messages
         elif kind == "WA_RECV" and e.get("employee") and e["employee"].lower() == employee.lower():
-            # Filter only actual messages, skip delivery receipts
-            for entry in e.get("payload", {}).get("entry", []):
+            payload = e.get("payload", {})
+            
+            # Case 1: Webhook style payload (entry → changes → value → messages)
+            entries = payload.get("entry", [])
+            for entry in entries:
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
-                    if "messages" in value:  # actual incoming msg
+                    if "messages" in value:
                         for m in value["messages"]:
                             msg_type = m.get("type")
                             chat.append({
                                 "sender": "Employee",
                                 "type": msg_type,
                                 "text": m.get("text", {}).get("body") if msg_type == "text" else None,
-                                "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document", "image", "audio"] else None,
+                                "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document","image","audio"] else None,
                                 "timestamp": m.get("timestamp")
                             })
 
+            # Case 2: Direct payload with messages (our WA_RECV from webhook append_jsonl)
+            if "messages" in payload:
+                for m in payload["messages"]:
+                    msg_type = m.get("type")
+                    chat.append({
+                        "sender": "Employee",
+                        "type": msg_type,
+                        "text": m.get("text", {}).get("body") if msg_type == "text" else None,
+                        "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document","image","audio"] else None,
+                        "timestamp": m.get("timestamp")
+                    })
+
     chat = sorted(chat, key=lambda x: x.get("timestamp") or "")
-    return {"employee": employee, "messages": chat}
+    return { "employee": employee, "messages": chat  , "events": events,}
+def append_event(record: dict):
+    try:
+        # record["at"] = now_iso()   ❌ temporarily hata do
+        supabase.table("events").insert(record).execute()
+        print("✅ Event saved in Supabase")
+    except Exception as e:
+        print(f"❌ Supabase insert error: {e}")
+
 
 
 @app.post("/send")
@@ -179,7 +244,8 @@ async def send_message(request: Request):
         "at": datetime.utcnow().isoformat(),
         "payload": {"text": {"body": message.get("text")}, "type": message.get("type", "text")}
     }
-    append_jsonl(EVENTS_FILE, record)
+    supabase.table("events").insert(record).execute()
+
     return {"status": "ok", "saved": record}
 
 
@@ -225,5 +291,7 @@ async def upload_file(file: UploadFile = File(...)):
         "path": str(file_path),
         "at": datetime.utcnow().isoformat(),
     }
-    append_jsonl(EVENTS_FILE, record)
+    supabase.table("events").insert(record).execute()
+
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+

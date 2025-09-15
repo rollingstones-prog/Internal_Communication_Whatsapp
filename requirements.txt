@@ -13,14 +13,16 @@ imageio-ffmpeg
 # AI / APIs
 openai
 google-generativeai
+supabase
 
 # PDF / Docs Handling
 pdfminer.six
 reportlab
 
-# Optional (DOCX parsing inside main.py)
+# Optional (DOCX parsing)
 python-docx
 
-# Others
-python-multipart
+# Audio / Media
+ffmpeg-python
+
 

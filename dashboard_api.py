@@ -57,6 +57,7 @@ def read_events(limit=200):
         print(f"❌ Supabase read error: {e}")
         return []
 
+
 # -------------------
 # Files & Directories
 # -------------------
@@ -299,5 +300,6 @@ async def upload_file(file: UploadFile = File(...)):
     supabase.table("events").insert(record).execute()
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+
 
 

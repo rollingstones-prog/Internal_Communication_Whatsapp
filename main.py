@@ -2,11 +2,10 @@
 from dashboard_api import find_employee_name_by_msisdn
 from elevenlabs_api import tts_to_mp3, stt_from_mp3
 from supabase import create_client
-from fastapi import FastAPI, Request, Response  # (updated)
+from fastapi import FastAPI, Request, Response  # FastAPI ko import karo
 
 # WhatsApp Lead Agent Bot (Single File)
 # (setup notes unchanged)
-
 import os
 import warnings
 
@@ -69,10 +68,50 @@ try:
 except ValueError:
     FOLLOWUP_MINUTES = 30
 
+# FastAPI instance initialize karo
 app = FastAPI()
 
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Webhook & Routes ---
+
+# Basic Health Check route (used in /docs)
+@app.get("/", summary="Health Check", tags=["health"])
+async def root():
+    return {"status": "ok", "service": "whatsapp-ai-agent"}
+
+# For HEAD requests (to avoid 405/404 errors in some environments)
+@app.head("/", include_in_schema=False)
+def head_root():
+    return Response(status_code=200)
+
+# Webhook verify route (Meta Webhook verification)
+@app.get("/webhook", summary="Verify Webhook")
+@app.get("/webhook/", include_in_schema=False)  # Accept both with and without trailing slash
+async def verify_webhook(request: Request):
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = (params.get("hub.verify_token") or "").strip()
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        # Return challenge back as plain text
+        return Response(content=str(challenge), media_type="text/plain", status_code=200)
+
+    return Response("Invalid token", media_type="text/plain", status_code=403)
+
+# Webhook POST route (to receive messages/status from WhatsApp)
+@app.post("/webhook", summary="Receive Webhook")
+async def receive_webhook(request: Request):
+    try:
+        body = await request.json()
+        # Add your message parsing logic here
+        # For now, we are simply acknowledging the receipt
+    except Exception:
+        pass
+    return Response("ok", media_type="text/plain", status_code=200)
+
 # -------------------- Health & Webhook routes --------------------
 
 # Basic health check (shows up in /docs)
@@ -2534,6 +2573,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+
 
 
 

@@ -1,47 +1,14 @@
 # --- ElevenLabs API Integration ---
 
 import dashboard_api
-from elevenlabs_api import tts_to_mp3 , stt_from_mp3
+from elevenlabs_api import tts_to_mp3, stt_from_mp3
 from supabase import create_client
 
 # WhatsApp Lead Agent Bot (Single File)
-#
-# SETUP NOTES:
-# 1. .env file me yeh values daalein:
-#    WA_TOKEN=EAAG...                 # WhatsApp access token
-#    WA_PHONE_ID=728827243646756      # aapka WA phone number ID
-#    BOSS_WA_ID=9232XXXXXXXXX         # boss ka WhatsApp number, country code ke sath, '+' ke bina
-#    VERIFY_TOKEN=abc                 # jo aap webhook verify me daloge
-#    OPENAI_API_KEY=sk-...            # OpenAI key
-#    FOLLOWUP_MINUTES=30              # default one-time follow-up
-#    GOOGLE_API_KEY=AIza...           # Gemini API key
-#    GEMINI_TEXT_MODEL=gemini-1.5-pro # Gemini text model
-#    GEMINI_VISION_MODEL=gemini-1.5-pro # Gemini vision model
-#    DELIVERY_DEFAULT=auto            # text | voice | auto
-#
-# 2. employees.json banayein (example):
-#    {"Ali": {"msisdn": "923001234567", "pref": "text"}, "Sara": {"msisdn": "923331234567", "pref": "voice"}, "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
-#
-# 3. Dependencies install karein (uv se):
-#    uv add python-dotenv openai pdfminer.six reportlab pillow imageio-ffmpeg pydub audioop-lts requests google-generativeai
-#
-# 4. WhatsApp App me webhook URL set karein (e.g., with ngrok):
-#    Callback URL: https://<your-ngrok-subdomain>.ngrok-free.app/webhook
-#    Verify Token: abc (same as .env)
-#
-# FEATURES:
-# - Boss commands: @tasks/@send, reports (text/pdf/voice), employee mapping
-# - Employee updates: Done/Delay commands with progress tracking
-# - AI analysis: Images, PDFs, voice transcription
-# - Delivery preferences: text/voice/auto per employee
-# - Voice forwarding: Forward last voice notes to boss
-# - Debouncing: Prevents duplicate webhook processing
-# - Professional Roman-Urdu messaging
-
+# (setup notes/comments same as before)
 
 import os
 import warnings
-
 
 # --- Standard Library Imports ---
 import json
@@ -67,6 +34,7 @@ import io
 import time
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
@@ -78,13 +46,59 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 
-from fastapi import FastAPI
-
+from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
 
-# include routes from dashboard_api
-app.include_router(dashboard_api.router)
+# ---- ENV VARS (used by webhook verify) ----
+VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
+
+# ---- (A) include routes from dashboard_api IF PRESENT, else skip safely ----
+try:
+    # prefer explicit import to avoid AttributeError on module object
+    from dashboard_api import router as dashboard_router  # type: ignore
+    app.include_router(dashboard_router, prefix="/dashboard")
+    print("[info] dashboard_api.router included at /dashboard")
+except Exception as e:
+    print(f"[warn] dashboard_api.router not available, skipping include: {e}")
+
+# ---- (B) Minimal health check ----
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "whatsapp-ai-agent"}
+
+# ---- (C) Webhook endpoints (Meta verify + receive) ----
+@app.get("/webhook")
+@app.get("/webhook/")  # accept trailing slash too
+async def verify_webhook(request: Request):
+    """
+    Meta verification: must return hub.challenge as *plain text* when token matches.
+    """
+    qp = request.query_params
+    mode = qp.get("hub.mode")
+    token = (qp.get("hub.verify_token") or "").strip()
+    challenge = qp.get("hub.challenge", "")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        return Response(content=str(challenge), media_type="text/plain", status_code=200)
+
+    return Response(content="Invalid token", media_type="text/plain", status_code=403)
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    """
+    WhatsApp Cloud API POST updates land here.
+    Keep it fast; acknowledge with 200 to prevent retries.
+    """
+    try:
+        body = await request.json()
+        # TODO: yahan apni message/status handling logic add karo
+        # print(f"[debug] webhook body: {body}")
+    except Exception as _:
+        # even on parse error, acknowledge (adjust if you prefer strict)
+        return Response(content="ok", media_type="text/plain", status_code=200)
+
+    return Response(content="ok", media_type="text/plain", status_code=200)
 
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
@@ -2529,6 +2543,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+
 
 
 

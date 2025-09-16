@@ -1,8 +1,8 @@
 # --- ElevenLabs API Integration ---
 from dashboard_api import find_employee_name_by_msisdn
-from elevenlabs_api import tts_to_mp3 , stt_from_mp3
+from elevenlabs_api import tts_to_mp3, stt_from_mp3
 from supabase import create_client
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response  # (updated)
 
 # WhatsApp Lead Agent Bot (Single File)
 #
@@ -20,13 +20,15 @@ from fastapi import FastAPI
 #    DELIVERY_DEFAULT=auto            # text | voice | auto
 #
 # 2. employees.json banayein (example):
-#    {"Ali": {"msisdn": "923001234567", "pref": "text"}, "Sara": {"msisdn": "923331234567", "pref": "voice"}, "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
+#    {"Ali": {"msisdn": "923001234567", "pref": "text"},
+#     "Sara": {"msisdn": "923331234567", "pref": "voice"},
+#     "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
 #
 # 3. Dependencies install karein (uv se):
 #    uv add python-dotenv openai pdfminer.six reportlab pillow imageio-ffmpeg pydub audioop-lts requests google-generativeai
 #
-# 4. WhatsApp App me webhook URL set karein (e.g., with ngrok):
-#    Callback URL: https://<your-ngrok-subdomain>.ngrok-free.app/webhook
+# 4. WhatsApp App me webhook URL set karein:
+#    Callback URL: https://<your-domain>/webhook
 #    Verify Token: abc (same as .env)
 #
 # FEATURES:
@@ -38,10 +40,8 @@ from fastapi import FastAPI
 # - Debouncing: Prevents duplicate webhook processing
 # - Professional Roman-Urdu messaging
 
-
 import os
 import warnings
-
 
 # --- Standard Library Imports ---
 import json
@@ -57,7 +57,7 @@ from urllib.parse import urlparse, parse_qs
 # --- Third-party Imports ---
 import requests
 from openai import OpenAI
-from pdfminer.high_level import extract_text
+from pdfminer_high_level import extract_text  # if you actually use: from pdfminer.high_level import extract_text
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -66,11 +66,12 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
+
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
-
 
 # Professional Roman-Urdu Phrases
 PHRASES = {
@@ -81,10 +82,13 @@ PHRASES = {
 
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
-print(WA_TOKEN)
+# (avoid leaking real token)
+if WA_TOKEN:
+    print(f"WA_TOKEN loaded (len={len(WA_TOKEN)})")
+
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
@@ -98,9 +102,52 @@ try:
     FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
 except ValueError:
     FOLLOWUP_MINUTES = 30
+
 app = FastAPI()
+
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ---------------------- Webhook endpoints ----------------------
+
+@app.get("/webhook")
+@app.get("/webhook/")  # accept trailing slash too
+async def verify_webhook(request: Request):
+    """
+    Meta verification: must return hub.challenge as plain text when the token matches.
+    """
+    qp = request.query_params
+    mode = qp.get("hub.mode")
+    token = (qp.get("hub.verify_token") or "").strip()
+    challenge = qp.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        return Response(content=str(challenge), media_type="text/plain", status_code=200)
+
+    return Response(content="Invalid token", media_type="text/plain", status_code=403)
+
+
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    """
+    WhatsApp Cloud API POST updates land here. Keep this fast; parse & enqueue if needed.
+    """
+    try:
+        body = await request.json()
+        # TODO: parse and handle messages/status updates here.
+        # e.g., entries = body.get("entry", [])
+        #       for e in entries: ...
+    except Exception:
+        # Acknowledge anyway to avoid retries; adjust if you prefer strict behavior
+        return Response(content="ok", media_type="text/plain", status_code=200)
+
+    return Response(content="ok", media_type="text/plain", status_code=200)
+
+
+# Health check (useful on Render)
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "whatsapp-ai-agent"}
 
 # --- Gemini (primary) + GPT-4o (fallback) router ---
 class ModelRouter:
@@ -2442,6 +2489,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

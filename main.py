@@ -61,7 +61,7 @@ GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
 DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WA_TOKEN = os.getenv("WA_TOKEN")  # WA_TOKEN ko environment se fetch karein
+
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -2575,6 +2575,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+
 
 
 

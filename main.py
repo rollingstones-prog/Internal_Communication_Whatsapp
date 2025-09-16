@@ -58,7 +58,6 @@ from pdfminer.high_level import extract_text
 # --- Third-party Imports ---
 import requests
 from openai import OpenAI
-from pdfminer_high_level import extract_text  # if you actually use: from pdfminer.high_level import extract_text
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -2490,6 +2489,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

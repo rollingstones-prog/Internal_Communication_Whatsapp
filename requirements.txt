@@ -1,14 +1,18 @@
 # Web framework
 fastapi
-uvicorn
+uvicorn[standard]
 
 # Utilities
 python-dotenv
 requests
+python-multipart
+
+# Audio / Media
 pydub
 audioop-lts
-pillow
+Pillow
 imageio-ffmpeg
+ffmpeg-python
 
 # AI / APIs
 openai
@@ -18,14 +22,4 @@ supabase
 # PDF / Docs Handling
 pdfminer.six
 reportlab
-
-# Optional (DOCX parsing)
 python-docx
-
-# Audio / Media
-ffmpeg-python
-python-multipart
-
-
-
-

@@ -1,8 +1,8 @@
 # --- ElevenLabs API Integration ---
-from dashboard_api import find_employee_name_by_msisdn
-from elevenlabs_api import tts_to_mp3, stt_from_mp3
+
+import dashboard_api
+from elevenlabs_api import tts_to_mp3 , stt_from_mp3
 from supabase import create_client
-from fastapi import FastAPI, Request, Response  # (updated)
 
 # WhatsApp Lead Agent Bot (Single File)
 #
@@ -20,15 +20,13 @@ from fastapi import FastAPI, Request, Response  # (updated)
 #    DELIVERY_DEFAULT=auto            # text | voice | auto
 #
 # 2. employees.json banayein (example):
-#    {"Ali": {"msisdn": "923001234567", "pref": "text"},
-#     "Sara": {"msisdn": "923331234567", "pref": "voice"},
-#     "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
+#    {"Ali": {"msisdn": "923001234567", "pref": "text"}, "Sara": {"msisdn": "923331234567", "pref": "voice"}, "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
 #
 # 3. Dependencies install karein (uv se):
 #    uv add python-dotenv openai pdfminer.six reportlab pillow imageio-ffmpeg pydub audioop-lts requests google-generativeai
 #
-# 4. WhatsApp App me webhook URL set karein:
-#    Callback URL: https://<your-domain>/webhook
+# 4. WhatsApp App me webhook URL set karein (e.g., with ngrok):
+#    Callback URL: https://<your-ngrok-subdomain>.ngrok-free.app/webhook
 #    Verify Token: abc (same as .env)
 #
 # FEATURES:
@@ -40,8 +38,10 @@ from fastapi import FastAPI, Request, Response  # (updated)
 # - Debouncing: Prevents duplicate webhook processing
 # - Professional Roman-Urdu messaging
 
+
 import os
 import warnings
+
 
 # --- Standard Library Imports ---
 import json
@@ -53,11 +53,11 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
-from pdfminer.high_level import extract_text
 
 # --- Third-party Imports ---
 import requests
 from openai import OpenAI
+from pdfminer.high_level import extract_text
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -66,9 +66,7 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
-
 load_dotenv(override=True)
-
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
@@ -80,15 +78,20 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 
+from fastapi import FastAPI
+from dashboard_api import router as dashboard_router
+
+app = FastAPI()
+
+# include routes from dashboard_api
+app.include_router(dashboard_api.router)
+
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
-# (avoid leaking real token)
-if WA_TOKEN:
-    print(f"WA_TOKEN loaded (len={len(WA_TOKEN)})")
-
+print(WA_TOKEN)
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
@@ -103,51 +106,8 @@ try:
 except ValueError:
     FOLLOWUP_MINUTES = 30
 
-app = FastAPI()
-
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---------------------- Webhook endpoints ----------------------
-
-@app.get("/webhook")
-@app.get("/webhook/")  # accept trailing slash too
-async def verify_webhook(request: Request):
-    """
-    Meta verification: must return hub.challenge as plain text when the token matches.
-    """
-    qp = request.query_params
-    mode = qp.get("hub.mode")
-    token = (qp.get("hub.verify_token") or "").strip()
-    challenge = qp.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-        return Response(content=str(challenge), media_type="text/plain", status_code=200)
-
-    return Response(content="Invalid token", media_type="text/plain", status_code=403)
-
-
-@app.post("/webhook")
-async def receive_webhook(request: Request):
-    """
-    WhatsApp Cloud API POST updates land here. Keep this fast; parse & enqueue if needed.
-    """
-    try:
-        body = await request.json()
-        # TODO: parse and handle messages/status updates here.
-        # e.g., entries = body.get("entry", [])
-        #       for e in entries: ...
-    except Exception:
-        # Acknowledge anyway to avoid retries; adjust if you prefer strict behavior
-        return Response(content="ok", media_type="text/plain", status_code=200)
-
-    return Response(content="ok", media_type="text/plain", status_code=200)
-
-
-# Health check (useful on Render)
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "whatsapp-ai-agent"}
 
 # --- Gemini (primary) + GPT-4o (fallback) router ---
 class ModelRouter:
@@ -276,6 +236,17 @@ EMP_PENDING = {}  # { "Hafiz": {"active": True, "items": {"text": "...", "images
 
 LAST_INSTRUCTION_PATH = Path("./reports/last_instruction.json")
 
+def find_employee_name_by_msisdn(msisdn: str):
+    """
+    Given a WhatsApp msisdn, return the mapped employee name from employees.json.
+    If not found, fallback to msisdn.
+    """
+    employees = load_employees()
+    for name, info in employees.items():
+        if info.get("msisdn") == msisdn:
+            return name
+    return msisdn
+
 def update_last_instruction(name):
     """Update last instruction timestamp for employee."""
     try:
@@ -327,6 +298,79 @@ def setup_storage():
             SEEN_MESSAGE_IDS = set(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         SEEN_MESSAGE_IDS = set()
+
+def _load_thread_for(name: str):
+    """Thread JSON (employee-wise) load karo."""
+    employees = load_employees()
+    emp = employees.get(name)
+    thread_id = emp["msisdn"] if emp else name
+    p = STORAGE_PATHS["reports"] / f"{thread_id}.json"
+    if not p.exists():
+        return {"thread_id": thread_id, "name": name, "messages": []}
+    return json.load(open(p, "r", encoding="utf-8"))
+
+def build_instruction_and_report_context(name: str, hours_assign=36, hours_report=24):
+    """
+    Boss ne kya assignments diye (recent), aur employee ne kya report ki —
+    dono ka short context string return (assignments, reports).
+    """
+    data = _load_thread_for(name)
+    now_naive = datetime.now().replace(tzinfo=None)
+
+    # recent windows
+    cutoff_assign = now_naive - timedelta(hours=hours_assign)
+    cutoff_report = now_naive - timedelta(hours=hours_report)
+
+    boss_txt = []
+    emp_txt = []
+
+    for m in data.get("messages", []):
+        ts = normalize_ts(m.get("ts"))
+        if not ts:
+            continue
+
+        # Boss → Employee (instructions / assignments)
+        if m.get("from") == "Boss" and ts >= cutoff_assign:
+            if (m.get("type") == "text") and m.get("text"):
+                boss_txt.append(m["text"])
+
+        # Employee → Boss (reports/updates)
+        if m.get("from") != "Boss" and ts >= cutoff_report:
+            if (m.get("type") == "text") and m.get("text"):
+                emp_txt.append(m["text"])
+
+    assignments = "\n".join(boss_txt[-10:])  # last few items
+    reports = "\n".join(emp_txt[-20:])
+    return assignments.strip(), reports.strip()
+
+
+def generate_next_working_suggestions(name: str) -> str:
+    """
+    Boss ke assignments vs employee report ko compare karke
+    Roman-Urdu me ‘Next Working Suggestions’ bullets bana do.
+    """
+    assignments, reports = build_instruction_and_report_context(name)
+    if not assignments and not reports:
+        return "Context kam mila — assignments/report dono recent thread me nazar nahi aaye."
+
+    user_prompt = f"""
+Boss ke assignments (recent):
+{assignments or '—'}
+
+Employee ki report (recent):
+{reports or '—'}
+
+Compare karke Roman-Urdu me sirf bullets do:
+- Konsa kaam ho chuka (✅)
+- Konsa pending ya “in progress” (⏳)
+- 3–5 Next Working Suggestions (priority order me), one-liners.
+Mehfooz, seedha, bina extra lafzon ke.
+"""
+    try:
+        return ROUTER.summarize_text(GLOBAL_STYLE, user_prompt)
+    except Exception:
+        return "Suggestions banate waqt temporary issue aaya."
+
 
 def save_seen_message_id(msg_id):
     """Save a message ID to the seen set and persist to disk."""
@@ -1329,10 +1373,14 @@ def read_full_day_report(name):
             "active": True,
             "awaiting_format": False,   # full analysis me format na poochna
             "employee": name,
-            "kind": "full",             # pura report analyze karna hai
+            "kind": "full",     
+            "wants_suggestions": None,   # NEW
+            "analysis_done": False,      # NEW        # pura report analyze karna hai
             "ts": int(time.time())
         })
         whatsapp_send_text(BOSS_WA_ID, f"Boss, {name} ki poori report ka analysis chahiye? (yes/no)")
+        whatsapp_send_text(BOSS_WA_ID, f"Director, {name} ke liye Next Working Suggestions chahiye? (true/false)")
+
 
         return f"{name} ki report bhej di gayi (last 12 ghante)."
 
@@ -1442,7 +1490,7 @@ def send_audio_to_boss(file_path, label_name):
 def schedule_followup(name, msisdn):
     cancel_followup(name)
     def send_followup():
-        whatsapp_send_text(msisdn, f"Salam {name}, apne kaam ka short update bhej dein. Shukriya.")
+        whatsapp_send_text(msisdn, f" {name}, apne kaam ka short update bhej dein. Shukriya.")
         del FOLLOWUP_TIMERS[name]
     
     timer = threading.Timer(FOLLOWUP_MINUTES * 60, send_followup)
@@ -1485,6 +1533,22 @@ def handle_boss_command(text, from_msisdn):
                                     "text": None, "transcript": None, "summary": None, "ts": 0
                                 }
                                 return
+                    # --- NEW: Suggestions flow (true/false) ---
+                        if t in {"true", "suggestions", "s"}:
+                            emp = BOSS_PENDING.get("employee")
+                            if emp:
+                                out = generate_next_working_suggestions(emp)
+                                for i in range(0, len(out), 3500):
+                                    whatsapp_send_text(from_msisdn, ("📌 Next Working Suggestions (" + emp + "):\n\n" + out)[i:i+3500])
+                                BOSS_PENDING["wants_suggestions"] = True
+                            return
+
+                        if t in {"false"}:
+                            BOSS_PENDING["wants_suggestions"] = False
+                            whatsapp_send_text(from_msisdn, "Noted — suggestions skip kar di gayi.")
+                            # yahan return; analysis prompt phir bhi valid rahegi
+                            return
+         
 
                             # 🔽 OLD single-file analysis logic
                             pth = BOSS_PENDING.get("path")
@@ -1880,7 +1944,7 @@ def handle_boss_command(text, from_msisdn):
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
-                message = f"Salam {emp_name}, apne kaam ka short update bhej dein. Shukriya."
+                message = f" {emp_name}, apne kaam ka short update bhej dein. Shukriya."
                 delivery_result = deliver_to_employee(emp_name, message)
                 if delivery_result["ok"]:
                     schedule_followup(emp_name, emp_data["msisdn"])
@@ -2465,30 +2529,6 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
-
-
-
-def main():
-    global BOSS_WA_ID
-    
-    if not all([WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID]):
-        warnings.warn("Warning: One or more required environment variables (WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID) are missing.")
-    
-    setup_storage()
-    
-    print(f"Boss WhatsApp ID: {BOSS_WA_ID}")
-    print("New commands: setboss, map, pref, forward voice, report <Name> voice")
-    print("Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali")
-    print("Voice routing: @voice Hira,Ali (then send audio), transcribe <Name> yes/no")
-    print("Docs: docs, employees")
-    print("NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester.")
-    
-    with socketserver.TCPServer((HOST, PORT), WebhookHandler) as httpd:
-        print(f"Listening on http://{HOST}:{PORT} (POST/GET /webhook)")
-        httpd.serve_forever()
-
-if __name__ == "__main__":
-    main()
 
 
 

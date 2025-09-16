@@ -1,11 +1,11 @@
 # --- ElevenLabs API Integration ---
-
-import dashboard_api
+from dashboard_api import find_employee_name_by_msisdn
 from elevenlabs_api import tts_to_mp3, stt_from_mp3
 from supabase import create_client
+from fastapi import FastAPI, Request, Response  # (updated)
 
 # WhatsApp Lead Agent Bot (Single File)
-# (setup notes/comments same as before)
+# (setup notes unchanged)
 
 import os
 import warnings
@@ -24,7 +24,7 @@ from urllib.parse import urlparse, parse_qs
 # --- Third-party Imports ---
 import requests
 from openai import OpenAI
-from pdfminer.high_level import extract_text
+from pdfminer.high_level import extract_text            # ✅ correct import (single)
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -33,6 +33,7 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
 # --- Global Configuration & Constants ---
@@ -46,66 +47,14 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 
-from fastapi import FastAPI, Request, Response
-
-app = FastAPI()
-
-# ---- ENV VARS (used by webhook verify) ----
-VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
-
-# ---- (A) include routes from dashboard_api IF PRESENT, else skip safely ----
-try:
-    # prefer explicit import to avoid AttributeError on module object
-    from dashboard_api import router as dashboard_router  # type: ignore
-    app.include_router(dashboard_router, prefix="/dashboard")
-    print("[info] dashboard_api.router included at /dashboard")
-except Exception as e:
-    print(f"[warn] dashboard_api.router not available, skipping include: {e}")
-
-# ---- (B) Minimal health check ----
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "whatsapp-ai-agent"}
-
-# ---- (C) Webhook endpoints (Meta verify + receive) ----
-@app.get("/webhook")
-@app.get("/webhook/")  # accept trailing slash too
-async def verify_webhook(request: Request):
-    """
-    Meta verification: must return hub.challenge as *plain text* when token matches.
-    """
-    qp = request.query_params
-    mode = qp.get("hub.mode")
-    token = (qp.get("hub.verify_token") or "").strip()
-    challenge = qp.get("hub.challenge", "")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-        return Response(content=str(challenge), media_type="text/plain", status_code=200)
-
-    return Response(content="Invalid token", media_type="text/plain", status_code=403)
-
-@app.post("/webhook")
-async def receive_webhook(request: Request):
-    """
-    WhatsApp Cloud API POST updates land here.
-    Keep it fast; acknowledge with 200 to prevent retries.
-    """
-    try:
-        body = await request.json()
-        # TODO: yahan apni message/status handling logic add karo
-        # print(f"[debug] webhook body: {body}")
-    except Exception as _:
-        # even on parse error, acknowledge (adjust if you prefer strict)
-        return Response(content="ok", media_type="text/plain", status_code=200)
-
-    return Response(content="ok", media_type="text/plain", status_code=200)
-
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
-print(WA_TOKEN)
+if WA_TOKEN:
+    print(f"WA_TOKEN loaded (len={len(WA_TOKEN)})")  # avoid printing actual token
+
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
@@ -120,8 +69,11 @@ try:
 except ValueError:
     FOLLOWUP_MINUTES = 30
 
+app = FastAPI()
+
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # --- Gemini (primary) + GPT-4o (fallback) router ---
 class ModelRouter:
@@ -2543,6 +2495,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+
 
 
 

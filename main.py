@@ -73,6 +73,45 @@ app = FastAPI()
 
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
+# -------------------- Health & Webhook routes --------------------
+
+# Basic health check (shows up in /docs)
+@app.get("/", summary="Health Check", tags=["health"])
+async def root():
+    return {"status": "ok", "service": "whatsapp-ai-agent"}
+
+# Allow Render's HEAD health probe (stops 405/404 noise)
+@app.head("/", include_in_schema=False)
+def head_root():
+    return Response(status_code=200)
+
+# Webhook verify (Meta calls GET during “Verify and save”)
+@app.get("/webhook", summary="Verify Webhook")
+@app.get("/webhook/", include_in_schema=False)  # accept trailing slash too
+async def verify_webhook(request: Request):
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = (params.get("hub.verify_token") or "").strip()
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        # MUST return challenge as plain text
+        return Response(content=str(challenge), media_type="text/plain", status_code=200)
+
+    return Response("Invalid token", media_type="text/plain", status_code=403)
+
+# Webhook receiver (Meta sends messages/status via POST)
+@app.post("/webhook", summary="Receive Webhook")
+async def receive_webhook(request: Request):
+    try:
+        body = await request.json()
+        # TODO: add your message/status handling here
+        # print(body)
+    except Exception:
+        # even on parse errors, acknowledge to prevent rapid retries
+        pass
+    return Response("ok", media_type="text/plain", status_code=200)
+
 
 
 # --- Gemini (primary) + GPT-4o (fallback) router ---
@@ -2495,6 +2534,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
                 mime_type = message[msg_type].get("mime_type")
                 filename = message[msg_type].get("filename")
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+
 
 
 

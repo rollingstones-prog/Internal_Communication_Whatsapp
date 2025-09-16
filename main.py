@@ -2,6 +2,7 @@
 from dashboard_api import find_employee_name_by_msisdn
 from elevenlabs_api import tts_to_mp3 , stt_from_mp3
 from supabase import create_client
+from fastapi import FastAPI
 
 # WhatsApp Lead Agent Bot (Single File)
 #
@@ -70,6 +71,7 @@ load_dotenv(override=True)
 PORT = 8000
 HOST = "0.0.0.0"
 
+
 # Professional Roman-Urdu Phrases
 PHRASES = {
     "emp_ack": "Update receive ho gaya. Shukriya.",
@@ -96,7 +98,7 @@ try:
     FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
 except ValueError:
     FOLLOWUP_MINUTES = 30
-
+app = FastAPI()
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -2440,5 +2442,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

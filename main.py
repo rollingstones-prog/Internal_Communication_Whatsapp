@@ -53,6 +53,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse, parse_qs
+from pdfminer.high_level import extract_text
 
 # --- Third-party Imports ---
 import requests
@@ -2489,6 +2490,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

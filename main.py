@@ -88,8 +88,10 @@ app = FastAPI()
 @app.get("/webhook")
 async def verify(request: Request):
     params = dict(request.query_params)
-    if (params.get("hub.mode") == "subscribe" and
-        params.get("hub.verify_token") == VERIFY_TOKEN):
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY_TOKEN
+    ):
         return int(params["hub.challenge"])
     return "Verification failed"
 
@@ -98,32 +100,32 @@ async def webhook(request: Request):
     data = await request.json()
     print("📩 Incoming WhatsApp:", data)
 
-    # --- Extract sender number (msisdn) safely ---
-    msisdn = None
     try:
+        # WhatsApp message body se thoda basic info nikal lo
         entry = data.get("entry", [])[0]
         change = entry.get("changes", [])[0]
         value = change.get("value", {})
         messages = value.get("messages", [])
+        msg_text = None
         if messages:
-            msisdn = messages[0].get("from")   # 👈 WhatsApp sender number
-    except Exception as e:
-        print("⚠️ msisdn extract error:", e)
+            msg_text = messages[0].get("text", {}).get("body")
 
-    # --- Save to Supabase ---
-    try:
+        # Supabase messages table me insert
         record = {
-            "kind": "WA_RECV",
-            "payload": data,
-            "msisdn": msisdn or "unknown",   # 👈 avoid null constraint
-            "at": datetime.utcnow().isoformat(),
+            "topic": "whatsapp",
+            "extension": "incoming",
+            "payload": data,              # full JSON save as jsonb
+            "event": msg_text or "event", # short summary
+            "private": False,
+            "inserted_at": datetime.utcnow().isoformat()
         }
-        supabase.table("events").insert(record).execute()
+        supabase.table("messages").insert(record).execute()
+        print("✅ Inserted into Supabase:", record)
+
     except Exception as e:
         print("❌ Supabase insert error:", e)
 
     return {"status": "ok"}
-
 
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
@@ -2600,5 +2602,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

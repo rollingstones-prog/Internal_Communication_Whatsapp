@@ -142,7 +142,6 @@ def stt_from_audio(audio_path: Path):
         print("❌ ElevenLabs STT exception:", str(e))
         return "Audio transcription me temporary issue hai."
 
-
 @app.get("/chats/all")
 def get_all_chats():
     events = read_events()
@@ -164,6 +163,17 @@ def get_all_chats():
         if kind == "WA_SEND":
             last_msg = e.get("payload", {}).get("text", {}).get("body") or "📎 Media"
             last_ts = e.get("at")
+
+            # ✅ sirf tab save karo jab employee ne abhi tak reply nahi kiya
+            if emp_name not in employees:
+                employees[emp_name] = {
+                    "name": emp_name,
+                    "msisdn": msisdn,
+                    "lastMessage": last_msg or "No message",
+                    "lastTimestamp": last_ts,
+                    "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
+                    "online": True
+                }
 
         # ---- Employee → Agent ----
         elif kind == "WA_RECV":
@@ -190,15 +200,15 @@ def get_all_chats():
                             last_msg = m.get("text", {}).get("body") if msg_type == "text" else "📎 Media"
                             last_ts = m.get("timestamp")
 
-        # ✅ Save/update employee summary
-        employees[emp_name] = {
-            "name": emp_name,
-            "msisdn": msisdn,
-            "lastMessage": last_msg or "No message",
-            "lastTimestamp": last_ts,
-            "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
-            "online": True
-        }
+            # ✅ Always overwrite with employee ka msg (latest priority)
+            employees[emp_name] = {
+                "name": emp_name,
+                "msisdn": msisdn,
+                "lastMessage": last_msg or "No message",
+                "lastTimestamp": last_ts,
+                "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
+                "online": True
+            }
 
     return {"employees": list(employees.values())}
 
@@ -353,3 +363,4 @@ async def upload_file(file: UploadFile = File(...)):
     supabase.table("events").insert(record).execute()
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+

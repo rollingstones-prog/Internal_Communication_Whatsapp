@@ -1,13 +1,50 @@
+
+
+
 # --- ElevenLabs API Integration ---
-from dashboard_api import find_employee_name_by_msisdn
-from elevenlabs_api import tts_to_mp3, stt_from_mp3
+
+import dashboard_api
+from elevenlabs_api import tts_to_mp3 , stt_from_mp3
 from supabase import create_client
-from fastapi import FastAPI, Request, Response  # FastAPI ko import karo
 
 # WhatsApp Lead Agent Bot (Single File)
-# (setup notes unchanged)
+#
+# SETUP NOTES:
+# 1. .env file me yeh values daalein:
+#    WA_TOKEN=EAAG...                 # WhatsApp access token
+#    WA_PHONE_ID=728827243646756      # aapka WA phone number ID
+#    BOSS_WA_ID=9232XXXXXXXXX         # boss ka WhatsApp number, country code ke sath, '+' ke bina
+#    VERIFY_TOKEN=abc                 # jo aap webhook verify me daloge
+#    OPENAI_API_KEY=sk-...            # OpenAI key
+#    FOLLOWUP_MINUTES=30              # default one-time follow-up
+#    GOOGLE_API_KEY=AIza...           # Gemini API key
+#    GEMINI_TEXT_MODEL=gemini-1.5-pro # Gemini text model
+#    GEMINI_VISION_MODEL=gemini-1.5-pro # Gemini vision model
+#    DELIVERY_DEFAULT=auto            # text | voice | auto
+#
+# 2. employees.json banayein (example):
+#    {"Ali": {"msisdn": "923001234567", "pref": "text"}, "Sara": {"msisdn": "923331234567", "pref": "voice"}, "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
+#
+# 3. Dependencies install karein (uv se):
+#    uv add python-dotenv openai pdfminer.six reportlab pillow imageio-ffmpeg pydub audioop-lts requests google-generativeai
+#
+# 4. WhatsApp App me webhook URL set karein (e.g., with ngrok):
+#    Callback URL: https://<your-ngrok-subdomain>.ngrok-free.app/webhook
+#    Verify Token: abc (same as .env)
+#
+# FEATURES:
+# - Boss commands: @tasks/@send, reports (text/pdf/voice), employee mapping
+# - Employee updates: Done/Delay commands with progress tracking
+# - AI analysis: Images, PDFs, voice transcription
+# - Delivery preferences: text/voice/auto per employee
+# - Voice forwarding: Forward last voice notes to boss
+# - Debouncing: Prevents duplicate webhook processing
+# - Professional Roman-Urdu messaging
+
+
 import os
 import warnings
+
 
 # --- Standard Library Imports ---
 import json
@@ -23,7 +60,7 @@ from urllib.parse import urlparse, parse_qs
 # --- Third-party Imports ---
 import requests
 from openai import OpenAI
-from pdfminer.high_level import extract_text            # ✅ correct import (single)
+from pdfminer.high_level import extract_text
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -32,9 +69,7 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
-
 load_dotenv(override=True)
-
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
@@ -46,14 +81,90 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 
+from fastapi import FastAPI, Request
+
+
+app = FastAPI()
+
+# include routes from dashboard_api
+
+from fastapi import FastAPI, Request
+from datetime import datetime
+import os
+from supabase import create_client
+
+# ENV variables
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "my_token")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+app = FastAPI()
+
+# ------------------------
+# GET /webhook (Meta Verify)
+# ------------------------
+@app.get("/webhook")
+async def verify(request: Request):
+    params = dict(request.query_params)
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY_TOKEN
+    ):
+        return int(params["hub.challenge"])
+    return "Verification failed"
+
+# ------------------------
+# POST /webhook (Incoming WA Msgs)
+# ------------------------
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    print("📩 Incoming WhatsApp:", data)
+
+    msg_text = None
+    from_msisdn = None
+    try:
+        entry = data.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages", [])
+        contacts = value.get("contacts", [])
+        if messages:
+            msg_text = messages[0].get("text", {}).get("body")
+            from_msisdn = contacts[0].get("wa_id")  # sender ka number
+    except Exception as e:
+        print("⚠️ Parsing error:", e)
+
+    # ✅ Save to Supabase
+    try:
+        record = {
+            "topic": "whatsapp",
+            "extension": "incoming",
+            "payload": data,
+            "event": msg_text or "event",
+            "private": False,
+            "inserted_at": datetime.utcnow().isoformat()
+        }
+        supabase.table("messages").insert(record).execute()
+        print("✅ Inserted into Supabase:", record)
+    except Exception as e:
+        print("❌ Supabase insert error:", e)
+
+    # ✅ Yahan se reply bhejna hoga
+    if msg_text and from_msisdn:
+        reply_text = f"Apka message mila: {msg_text}"
+        whatsapp_send_text(from_msisdn, reply_text)
+
+    return {"status": "ok"}
+
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
-if WA_TOKEN:
-    print(f"WA_TOKEN loaded (len={len(WA_TOKEN)})")  # avoid printing actual token
 
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = (os.getenv("VERIFY_TOKEN") or "").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
@@ -61,8 +172,6 @@ GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
 DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 try:
@@ -70,90 +179,8 @@ try:
 except ValueError:
     FOLLOWUP_MINUTES = 30
 
-# FastAPI instance initialize karo
-app = FastAPI()
-
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# --- Webhook & Routes ---
-
-# Basic Health Check route (used in /docs)
-@app.get("/", summary="Health Check", tags=["health"])
-async def root():
-    return {"status": "ok", "service": "whatsapp-ai-agent"}
-
-# For HEAD requests (to avoid 405/404 errors in some environments)
-@app.head("/", include_in_schema=False)
-def head_root():
-    return Response(status_code=200)
-
-# Webhook verify route (Meta Webhook verification)
-@app.get("/webhook", summary="Verify Webhook")
-@app.get("/webhook/", include_in_schema=False)  # Accept both with and without trailing slash
-async def verify_webhook(request: Request):
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = (params.get("hub.verify_token") or "").strip()
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-        # Return challenge back as plain text
-        return Response(content=str(challenge), media_type="text/plain", status_code=200)
-
-    return Response("Invalid token", media_type="text/plain", status_code=403)
-
-# Webhook POST route (to receive messages/status from WhatsApp)
-@app.post("/webhook", summary="Receive Webhook")
-async def receive_webhook(request: Request):
-    try:
-        body = await request.json()
-        # Add your message parsing logic here
-        # For now, we are simply acknowledging the receipt
-    except Exception:
-        pass
-    return Response("ok", media_type="text/plain", status_code=200)
-
-# -------------------- Health & Webhook routes --------------------
-
-# Basic health check (shows up in /docs)
-@app.get("/", summary="Health Check", tags=["health"])
-async def root():
-    return {"status": "ok", "service": "whatsapp-ai-agent"}
-
-# Allow Render's HEAD health probe (stops 405/404 noise)
-@app.head("/", include_in_schema=False)
-def head_root():
-    return Response(status_code=200)
-
-# Webhook verify (Meta calls GET during “Verify and save”)
-@app.get("/webhook", summary="Verify Webhook")
-@app.get("/webhook/", include_in_schema=False)  # accept trailing slash too
-async def verify_webhook(request: Request):
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = (params.get("hub.verify_token") or "").strip()
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-        # MUST return challenge as plain text
-        return Response(content=str(challenge), media_type="text/plain", status_code=200)
-
-    return Response("Invalid token", media_type="text/plain", status_code=403)
-
-# Webhook receiver (Meta sends messages/status via POST)
-@app.post("/webhook", summary="Receive Webhook")
-async def receive_webhook(request: Request):
-    try:
-        body = await request.json()
-        # TODO: add your message/status handling here
-        # print(body)
-    except Exception:
-        # even on parse errors, acknowledge to prevent rapid retries
-        pass
-    return Response("ok", media_type="text/plain", status_code=200)
-
-
 
 # --- Gemini (primary) + GPT-4o (fallback) router ---
 class ModelRouter:
@@ -1788,6 +1815,14 @@ def handle_boss_command(text, from_msisdn):
                 if target_name in employees:
                     polished_message = polish_to_employee(target_name, body)
                     delivery_result = deliver_to_employee(target_name, polished_message)
+                    # ✅ Employee se analysis puchho
+                    EMP_PENDING[name] = {
+                        "active": True,
+                        "items": {"text": body}
+                    }
+                    whatsapp_send_text(employees[name]["msisdn"],
+                        f"{name}, Kya aapko iska short analysis/bullets chahiye? (yes/no)")
+
                     if delivery_result["ok"]:
                         write_report(target_name, "BOSS -> EMPLOYEE (multi-tasks)", body)
                         schedule_followup(target_name, employees[target_name]["msisdn"])
@@ -2578,13 +2613,24 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
 
 
 
+def main():
+    global BOSS_WA_ID
+    
+    if not all([WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID]):
+        warnings.warn("Warning: One or more required environment variables (WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID) are missing.")
+    
+    setup_storage()
+    
+    print(f"Boss WhatsApp ID: {BOSS_WA_ID}")
+    print("New commands: setboss, map, pref, forward voice, report <Name> voice")
+    print("Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali")
+    print("Voice routing: @voice Hira,Ali (then send audio), transcribe <Name> yes/no")
+    print("Docs: docs, employees")
+    print("NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester.")
+    
+    with socketserver.TCPServer((HOST, PORT), WebhookHandler) as httpd:
+        print(f"Listening on http://{HOST}:{PORT} (POST/GET /webhook)")
+        httpd.serve_forever()
 
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()

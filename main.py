@@ -100,32 +100,42 @@ async def webhook(request: Request):
     data = await request.json()
     print("📩 Incoming WhatsApp:", data)
 
+    msg_text = None
+    from_msisdn = None
     try:
-        # WhatsApp message body se thoda basic info nikal lo
         entry = data.get("entry", [])[0]
         change = entry.get("changes", [])[0]
         value = change.get("value", {})
         messages = value.get("messages", [])
-        msg_text = None
+        contacts = value.get("contacts", [])
         if messages:
             msg_text = messages[0].get("text", {}).get("body")
+            from_msisdn = contacts[0].get("wa_id")  # sender ka number
+    except Exception as e:
+        print("⚠️ Parsing error:", e)
 
-        # Supabase messages table me insert
+    # ✅ Save to Supabase
+    try:
         record = {
             "topic": "whatsapp",
             "extension": "incoming",
-            "payload": data,              # full JSON save as jsonb
-            "event": msg_text or "event", # short summary
+            "payload": data,
+            "event": msg_text or "event",
             "private": False,
             "inserted_at": datetime.utcnow().isoformat()
         }
         supabase.table("messages").insert(record).execute()
         print("✅ Inserted into Supabase:", record)
-
     except Exception as e:
         print("❌ Supabase insert error:", e)
 
+    # ✅ Yahan se reply bhejna hoga
+    if msg_text and from_msisdn:
+        reply_text = f"Apka message mila: {msg_text}"
+        whatsapp_send_text(from_msisdn, reply_text)
+
     return {"status": "ok"}
+
 
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
@@ -2602,6 +2612,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

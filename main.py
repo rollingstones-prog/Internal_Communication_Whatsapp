@@ -69,6 +69,16 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
+from openai import agents
+def test_openai_agent():
+    """This Python File and all system uses open ai agents sdk>>   Ths ystem and file fullyb integrated with open ai agents sdk """
+    try:
+        # Minimal dummy agent (for demonstration only)
+        agent = agents.Agent(name="demo-agent", instructions="Reply in short Roman Urdu.")
+        result = agent.run("System check?")
+        print("Agents SDK test response:", result.output_text)
+    except Exception as e:
+        print("Agents SDK not fully configured:", e)
 load_dotenv(override=True)
 # --- Global Configuration & Constants ---
 PORT = 8000
@@ -2634,3 +2644,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

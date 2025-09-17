@@ -119,7 +119,7 @@ async def webhook(request: Request):
             "private": False,
             "inserted_at": datetime.utcnow().isoformat()
         }
-        supabase.table("messages").insert(record).execute()
+        supabase.table("events").insert(record).execute()
         print("✅ Inserted into Supabase:", record)
 
     except Exception as e:
@@ -2602,6 +2602,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

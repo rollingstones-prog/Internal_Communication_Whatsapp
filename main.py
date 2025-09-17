@@ -129,12 +129,15 @@ async def webhook(request: Request):
     except Exception as e:
         print("❌ Supabase insert error:", e)
 
-    # ✅ Yahan se reply bhejna hoga
+    # ✅ Boss ya Employee Handling
     if msg_text and from_msisdn:
-        reply_text = f"Apka message mila: {msg_text}"
-        whatsapp_send_text(from_msisdn, reply_text)
+        if from_msisdn == BOSS_WA_ID:
+            handle_boss_command(msg_text, from_msisdn)
+        else:
+            whatsapp_send_text(from_msisdn, f"Apka message mila: {msg_text}")
 
     return {"status": "ok"}
+
 
 
 # Environment Variables
@@ -2612,6 +2615,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

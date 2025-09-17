@@ -98,11 +98,24 @@ async def webhook(request: Request):
     data = await request.json()
     print("📩 Incoming WhatsApp:", data)
 
-    # ✅ Supabase events table me log insert karo
+    # --- Extract sender number (msisdn) safely ---
+    msisdn = None
+    try:
+        entry = data.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages", [])
+        if messages:
+            msisdn = messages[0].get("from")   # 👈 WhatsApp sender number
+    except Exception as e:
+        print("⚠️ msisdn extract error:", e)
+
+    # --- Save to Supabase ---
     try:
         record = {
             "kind": "WA_RECV",
             "payload": data,
+            "msisdn": msisdn or "unknown",   # 👈 avoid null constraint
             "at": datetime.utcnow().isoformat(),
         }
         supabase.table("events").insert(record).execute()
@@ -110,6 +123,7 @@ async def webhook(request: Request):
         print("❌ Supabase insert error:", e)
 
     return {"status": "ok"}
+
 
 # Environment Variables
 WA_TOKEN = os.getenv("WA_TOKEN")
@@ -2586,4 +2600,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

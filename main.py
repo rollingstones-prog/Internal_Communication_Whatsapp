@@ -147,6 +147,11 @@ async def webhook(request: Request):
     except Exception as e:
         print("⚠️ Parsing error:", e)
 
+    
+@app.get("/")
+def home():
+    return {"status": "✅ Server is live and working!"}
+
     # ✅ Save to Supabase
     try:
         record = {
@@ -2644,4 +2649,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

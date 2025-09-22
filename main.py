@@ -681,7 +681,7 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
 
         record = {
             "at": now_iso(),
-            "kind": "BOSS_INTENT",
+            "kind": "WA_SEND"
             "employee": emp_name,
             "msisdn": to_msisdn,
             "to": to_msisdn,
@@ -2580,5 +2580,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

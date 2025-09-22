@@ -1,12 +1,9 @@
-
-
-
 # --- ElevenLabs API Integration ---
-
-import dashboard_api
+from fastapi import FastAPI
+import supabase
+from supabase_functions import create_client
+from dashboard_api import find_employee_name_by_msisdn
 from elevenlabs_api import tts_to_mp3 , stt_from_mp3
-from supabase import create_client
-
 # WhatsApp Lead Agent Bot (Single File)
 #
 # SETUP NOTES:
@@ -69,20 +66,11 @@ import google.generativeai as genai
 import io
 import time
 from dotenv import load_dotenv
-from openai import agents
-def test_openai_agent():
-    """This Python File and all system uses open ai agents sdk>>   Ths ystem and file fullyb integrated with open ai agents sdk """
-    try:
-        # Minimal dummy agent (for demonstration only)
-        agent = agents.Agent(name="demo-agent", instructions="Reply in short Roman Urdu.")
-        result = agent.run("System check?")
-        print("Agents SDK test response:", result.output_text)
-    except Exception as e:
-        print("Agents SDK not fully configured:", e)
 load_dotenv(override=True)
 # --- Global Configuration & Constants ---
 PORT = 8000
 HOST = "0.0.0.0"
+
 
 # Professional Roman-Urdu Phrases
 PHRASES = {
@@ -91,32 +79,29 @@ PHRASES = {
     "delay_ack": "Delay note kar liya hai."
 }
 
-from fastapi import FastAPI, Request
-
-
-app = FastAPI()
-
-# include routes from dashboard_api
-
-from fastapi import FastAPI, Request
-from datetime import datetime
-import os
-from supabase import create_client
-
-# ENV variables
+# Environment Variables
+WA_TOKEN = os.getenv("WA_TOKEN")
+print(WA_TOKEN)
+WA_PHONE_ID = os.getenv("WA_PHONE_ID")
+BOSS_WA_ID = os.getenv("BOSS_WA_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
+DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "my_token")
-
+try:
+    FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
+except ValueError:
+    FOLLOWUP_MINUTES = 30
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
-# ------------------------
-# GET /webhook (Meta Verify)
-# ------------------------
 @app.get("/webhook")
-async def verify(request: Request):
+async def verify(request: requests.Request):
     params = dict(request.query_params)
     if (
         params.get("hub.mode") == "subscribe"
@@ -129,7 +114,7 @@ async def verify(request: Request):
 # POST /webhook (Incoming WA Msgs)
 # ------------------------
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: requests.Request):
     data = await request.json()
     print("📩 Incoming WhatsApp:", data)
 
@@ -146,11 +131,6 @@ async def webhook(request: Request):
             from_msisdn = contacts[0].get("wa_id")  # sender ka number
     except Exception as e:
         print("⚠️ Parsing error:", e)
-
-    
-@app.get("/")
-def home():
-    return {"status": "✅ Server is live and working!"}
 
     # ✅ Save to Supabase
     try:
@@ -169,30 +149,14 @@ def home():
 
     # ✅ Yahan se reply bhejna hoga
     if msg_text and from_msisdn:
+        # If it's a boss message, call the boss command handler
+        if from_msisdn == BOSS_WA_ID:
+            handle_boss_command(msg_text, from_msisdn)  # Call to handle boss's command
+
         reply_text = f"Apka message mila: {msg_text}"
         whatsapp_send_text(from_msisdn, reply_text)
 
     return {"status": "ok"}
-
-# Environment Variables
-WA_TOKEN = os.getenv("WA_TOKEN")
-
-WA_PHONE_ID = os.getenv("WA_PHONE_ID")
-BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
-DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-try:
-    FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
-except ValueError:
-    FOLLOWUP_MINUTES = 30
 
 # OpenAI Client
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -276,7 +240,17 @@ class ModelRouter:
                 return "Temporary image analysis issue."
 
 ROUTER = ModelRouter(client)
-
+from openai import agents
+def test_openai_agent():
+    """This Python File and all system uses open ai agents sdk>>   Ths ystem and file fullyb integrated with open ai agents sdk """
+    try:
+        # Minimal dummy agent (for demonstration only)
+        agent = agents.Agent(name="demo-agent", instructions="Reply in short Roman Urdu.")
+        result = agent.run("System check?")
+        print("Agents SDK test response:", result.output_text)
+    except Exception as e:
+        print("Agents SDK not fully configured:", e)
+load_dotenv(override=True)
 # Prompts
 GLOBAL_STYLE = "Roman Urdu (Karachi), short & professional. Sirf kaam ki baat. Over-explain nahi. Agar info na mile to seedha keh do."
 IMG_PROMPT = "Is tasveer ki seedhi analysis Roman-Urdu me bullets (max 10) likho. Agar text/404/UX issues nazar aayen to mention karo. Tone simple."
@@ -323,17 +297,6 @@ BOSS_PENDING = {
 EMP_PENDING = {}  # { "Hafiz": {"active": True, "items": {"text": "...", "images": [Path..], "docs": [Path..], "audio": [Path..]}} }
 
 LAST_INSTRUCTION_PATH = Path("./reports/last_instruction.json")
-
-def find_employee_name_by_msisdn(msisdn: str):
-    """
-    Given a WhatsApp msisdn, return the mapped employee name from employees.json.
-    If not found, fallback to msisdn.
-    """
-    employees = load_employees()
-    for name, info in employees.items():
-        if info.get("msisdn") == msisdn:
-            return name
-    return msisdn
 
 def update_last_instruction(name):
     """Update last instruction timestamp for employee."""
@@ -386,79 +349,6 @@ def setup_storage():
             SEEN_MESSAGE_IDS = set(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         SEEN_MESSAGE_IDS = set()
-
-def _load_thread_for(name: str):
-    """Thread JSON (employee-wise) load karo."""
-    employees = load_employees()
-    emp = employees.get(name)
-    thread_id = emp["msisdn"] if emp else name
-    p = STORAGE_PATHS["reports"] / f"{thread_id}.json"
-    if not p.exists():
-        return {"thread_id": thread_id, "name": name, "messages": []}
-    return json.load(open(p, "r", encoding="utf-8"))
-
-def build_instruction_and_report_context(name: str, hours_assign=36, hours_report=24):
-    """
-    Boss ne kya assignments diye (recent), aur employee ne kya report ki —
-    dono ka short context string return (assignments, reports).
-    """
-    data = _load_thread_for(name)
-    now_naive = datetime.now().replace(tzinfo=None)
-
-    # recent windows
-    cutoff_assign = now_naive - timedelta(hours=hours_assign)
-    cutoff_report = now_naive - timedelta(hours=hours_report)
-
-    boss_txt = []
-    emp_txt = []
-
-    for m in data.get("messages", []):
-        ts = normalize_ts(m.get("ts"))
-        if not ts:
-            continue
-
-        # Boss → Employee (instructions / assignments)
-        if m.get("from") == "Boss" and ts >= cutoff_assign:
-            if (m.get("type") == "text") and m.get("text"):
-                boss_txt.append(m["text"])
-
-        # Employee → Boss (reports/updates)
-        if m.get("from") != "Boss" and ts >= cutoff_report:
-            if (m.get("type") == "text") and m.get("text"):
-                emp_txt.append(m["text"])
-
-    assignments = "\n".join(boss_txt[-10:])  # last few items
-    reports = "\n".join(emp_txt[-20:])
-    return assignments.strip(), reports.strip()
-
-
-def generate_next_working_suggestions(name: str) -> str:
-    """
-    Boss ke assignments vs employee report ko compare karke
-    Roman-Urdu me ‘Next Working Suggestions’ bullets bana do.
-    """
-    assignments, reports = build_instruction_and_report_context(name)
-    if not assignments and not reports:
-        return "Context kam mila — assignments/report dono recent thread me nazar nahi aaye."
-
-    user_prompt = f"""
-Boss ke assignments (recent):
-{assignments or '—'}
-
-Employee ki report (recent):
-{reports or '—'}
-
-Compare karke Roman-Urdu me sirf bullets do:
-- Konsa kaam ho chuka (✅)
-- Konsa pending ya “in progress” (⏳)
-- 3–5 Next Working Suggestions (priority order me), one-liners.
-Mehfooz, seedha, bina extra lafzon ke.
-"""
-    try:
-        return ROUTER.summarize_text(GLOBAL_STYLE, user_prompt)
-    except Exception:
-        return "Suggestions banate waqt temporary issue aaya."
-
 
 def save_seen_message_id(msg_id):
     """Save a message ID to the seen set and persist to disk."""
@@ -797,10 +687,8 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
             "to": to_msisdn,
             "payload": {"text": {"body": text}, "type": "text"}
         }
+        append_jsonl(STORAGE_PATHS["events"], record)
 
-        
-
-        append_event(record)
         if resp.status_code >= 400:
             handle_whatsapp_error(data, to_msisdn)  # ALWAYS dict-like
         return data
@@ -1461,14 +1349,10 @@ def read_full_day_report(name):
             "active": True,
             "awaiting_format": False,   # full analysis me format na poochna
             "employee": name,
-            "kind": "full",     
-            "wants_suggestions": None,   # NEW
-            "analysis_done": False,      # NEW        # pura report analyze karna hai
+            "kind": "full",             # pura report analyze karna hai
             "ts": int(time.time())
         })
         whatsapp_send_text(BOSS_WA_ID, f"Boss, {name} ki poori report ka analysis chahiye? (yes/no)")
-        whatsapp_send_text(BOSS_WA_ID, f"Director, {name} ke liye Next Working Suggestions chahiye? (true/false)")
-
 
         return f"{name} ki report bhej di gayi (last 12 ghante)."
 
@@ -1578,7 +1462,7 @@ def send_audio_to_boss(file_path, label_name):
 def schedule_followup(name, msisdn):
     cancel_followup(name)
     def send_followup():
-        whatsapp_send_text(msisdn, f" {name}, apne kaam ka short update bhej dein. Shukriya.")
+        whatsapp_send_text(msisdn, f"Salam {name}, apne kaam ka short update bhej dein. Shukriya.")
         del FOLLOWUP_TIMERS[name]
     
     timer = threading.Timer(FOLLOWUP_MINUTES * 60, send_followup)
@@ -1621,22 +1505,6 @@ def handle_boss_command(text, from_msisdn):
                                     "text": None, "transcript": None, "summary": None, "ts": 0
                                 }
                                 return
-                    # --- NEW: Suggestions flow (true/false) ---
-                        if t in {"true", "suggestions", "s"}:
-                            emp = BOSS_PENDING.get("employee")
-                            if emp:
-                                out = generate_next_working_suggestions(emp)
-                                for i in range(0, len(out), 3500):
-                                    whatsapp_send_text(from_msisdn, ("📌 Next Working Suggestions (" + emp + "):\n\n" + out)[i:i+3500])
-                                BOSS_PENDING["wants_suggestions"] = True
-                            return
-
-                        if t in {"false"}:
-                            BOSS_PENDING["wants_suggestions"] = False
-                            whatsapp_send_text(from_msisdn, "Noted — suggestions skip kar di gayi.")
-                            # yahan return; analysis prompt phir bhi valid rahegi
-                            return
-         
 
                             # 🔽 OLD single-file analysis logic
                             pth = BOSS_PENDING.get("path")
@@ -1830,14 +1698,6 @@ def handle_boss_command(text, from_msisdn):
                 if target_name in employees:
                     polished_message = polish_to_employee(target_name, body)
                     delivery_result = deliver_to_employee(target_name, polished_message)
-                    # ✅ Employee se analysis puchho
-                    EMP_PENDING[name] = {
-                        "active": True,
-                        "items": {"text": body}
-                    }
-                    whatsapp_send_text(employees[name]["msisdn"],
-                        f"{name}, Kya aapko iska short analysis/bullets chahiye? (yes/no)")
-
                     if delivery_result["ok"]:
                         write_report(target_name, "BOSS -> EMPLOYEE (multi-tasks)", body)
                         schedule_followup(target_name, employees[target_name]["msisdn"])
@@ -2040,7 +1900,7 @@ def handle_boss_command(text, from_msisdn):
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
-                message = f" {emp_name}, apne kaam ka short update bhej dein. Shukriya."
+                message = f"Salam {emp_name}, apne kaam ka short update bhej dein. Shukriya."
                 delivery_result = deliver_to_employee(emp_name, message)
                 if delivery_result["ok"]:
                     schedule_followup(emp_name, emp_data["msisdn"])
@@ -2485,34 +2345,48 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
     # Send ack to employee only
     if ack_msg:
         whatsapp_send_text(from_msisdn, ack_msg)
-# 🌍 Global append_event function
-def append_event(record: dict):
-    print("👉 append_event called with:", record)   # Debug
-    try:
-        resp = supabase.table("events").insert(record).execute()
-        print("👉 Supabase response:", resp)
-    except Exception as e:
-        print(f"❌ Supabase insert error: {e}")
 
 # --- HTTP Server ---
 class WebhookHandler(http.server.BaseHTTPRequestHandler):
+    def update_employee_chat(self, msisdn, msg_text):
+        """Update employees.json with latest WhatsApp message"""
+        try:
+            import json
+            employees_file = STORAGE_PATHS["employees"]
+
+            if employees_file.exists():
+                with open(employees_file, "r", encoding="utf-8") as f:
+                    employees = json.load(f)
+            else:
+                employees = {}
+
+            # Agar employee exist nahi karta, new entry banao
+            if msisdn not in employees:
+                employees[msisdn] = {"msisdn": msisdn, "messages": []}
+
+            employees[msisdn]["messages"].append({
+                "timestamp": int(time.time()),
+                "text": msg_text
+            })
+
+            with open(employees_file, "w", encoding="utf-8") as f:
+                json.dump(employees, f, indent=2)
+
+            print(f"✅ Updated chat for {msisdn}: {msg_text}")
+
+        except Exception as e:
+            print("❌ Failed to update employee chat:", e)
     def do_GET(self):
         parsed_path = urlparse(self.path)
         query = parse_qs(parsed_path.query)
-
+        
         if parsed_path.path == "/webhook":
-            if (
-                "hub.mode" in query
-                and "hub.verify_token" in query
-                and query["hub.mode"][0] == "subscribe"
-                and query["hub.verify_token"][0] == VERIFY_TOKEN
-            ):
-                challenge = query["hub.challenge"][0]
-                print(f"Webhook verified! challenge={challenge}")
+            if ('hub.mode' in query and 'hub.verify_token' in query and
+                    query['hub.mode'][0] == 'subscribe' and
+                    query['hub.verify_token'][0] == VERIFY_TOKEN):
                 self.send_response(200)
-                self.send_header("Content-type", "text/plain")
                 self.end_headers()
-                self.wfile.write(challenge.encode("utf-8"))  # ✅ Meta ko exact challenge chahiye
+                self.wfile.write(query['hub.challenge'][0].encode())
             else:
                 self.send_response(403)
                 self.end_headers()
@@ -2522,109 +2396,166 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/webhook":
-            content_length = int(self.headers.get("Content-Length", 0))
-            post_data = self.rfile.read(content_length)
             try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                post_data = self.rfile.read(content_length)
                 data = json.loads(post_data)
-            except Exception:
-                data = {}
 
-            # Always log raw payload for debugging
-            append_jsonl(STORAGE_PATHS["events"], {
-                "kind": "WA_RECV_RAW",
-                "payload": data,
-                "timestamp": now_iso()
-            })
+                # 1️⃣ Har event ko raw log me save karo
+                append_jsonl(STORAGE_PATHS["events"], {
+                    "direction": "in",
+                    "payload": data
+                })
 
-            if "entry" in data:
-                for entry in data["entry"]:
-                    for change in entry.get("changes", []):
-                        value = change.get("value", {})
-                        if "messages" in value:
-                            for message in value["messages"]:
-                                try:
-                                    self.process_message(message, value)
-                                except Exception as e:
-                                    print("Process error:", e)
+                # 2️⃣ WhatsApp message extract karo
+                if "entry" in data:
+                    for entry in data.get("entry", []):
+                        for change in entry.get("changes", []):
+                            value = change.get("value", {})
+                            if "messages" in value:
+                                for message in value["messages"]:
+                                    # Yeh tumhara custom processor
+                                    self.process_message(message)
 
-            self.send_response(200)
-            self.end_headers()
+                                    # 3️⃣ Employee chat me append karo
+                                    sender = message.get("from")   # e.g. "923001234567"
+                                    msg_text = None
+
+                                    if "text" in message:
+                                        msg_text = message["text"]["body"]
+                                    elif "button" in message:
+                                        msg_text = f"[Button] {message['button'].get('text')}"
+                                    elif "interactive" in message:
+                                        msg_text = "[Interactive reply]"
+                                    elif "audio" in message:
+                                        msg_text = "[Audio message]"
+                                    else:
+                                        msg_text = "[Unsupported message type]"
+
+                                    # Save/update employees.json
+                                    self.update_employee_chat(sender, msg_text)
+
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                print("❌ Error in do_POST:", e)
+                self.send_response(500)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
 
-    def process_message(self, message, value):
-        from_msisdn = message.get("from")
-        msg_type = message.get("type")
-        msg_id = message.get("id")
+    def process_message(self, message):
+        from_msisdn = message.get('from')
+        msg_type = message.get('type')
+        msg_id = message.get('id')
 
-        print(f"📩 Message from {from_msisdn}, type={msg_type}")
+        # Debug logging
+        print(f"Message from {from_msisdn}, type: {msg_type}")
 
-        # Debounce check
+        # Check for duplicate messages
         if msg_id and is_message_seen(msg_id):
-            print("Duplicate message, skipping")
+            print("Duplicate message detected, skipping")
             return
+        
+        # Mark message as seen
         if msg_id:
             save_seen_message_id(msg_id)
 
         employees = load_employees()
-        sender_name, sender_info = None, None
+        sender_name = None
+        sender_info = None
         for name, info in employees.items():
             if info["msisdn"] == from_msisdn:
-                sender_name, sender_info = name, info
+                sender_name = name
+                sender_info = info
                 break
-
         is_boss = (from_msisdn == BOSS_WA_ID)
 
-        # === Employee message ===
-        # === Employee message ===
         if not is_boss and sender_name:
-            # ✅ Save WA_RECV in Supabase
-            record = {
-                "kind": "WA_RECV",
-                "employee": sender_name or "Unknown",
-                "msisdn": from_msisdn,
-                "to": BOSS_WA_ID,             # Boss ka WA ID hamesha bharo
-                "at": now_iso(),
-                "payload": message            # full WhatsApp JSON
-            }
-            append_event(record)
-            print(record)
-
-            # ✅ Acknowledge to employee
-            whatsapp_send_text(from_msisdn, f"{sender_name}, aapka message receive ho gaya hai ✅")
-
-            # ✅ Handle text vs media
-            if msg_type == "text":
-                handle_employee_message(message["text"]["body"], from_msisdn, sender_name)
-            elif msg_type in ["image", "document", "audio", "voice"]:
-                if msg_type == "voice":
-                    msg_type = "audio"
-                medi_id = message[msg_type]["id"]
-                mime_type = message[msg_type].get("mime_type")
-                filename = message[msg_type].get("filename")
+            # Always notify boss with mapped name and number
+            
+            # Confirm to employee
+            whatsapp_send_text(from_msisdn, f" {sender_name}, aapka message receive ho gaya hai..")
+            # Proceed with employee message handling
+            if msg_type == 'text':
+                text = message['text']['body']
+                handle_employee_message(text, from_msisdn, sender_name)
+            elif msg_type in ['image', 'document', 'audio', 'voice']:
+                if msg_type == 'voice':
+                    msg_type = 'audio'
+                medi_id = message[msg_type]['id']
+                mime_type = message[msg_type].get('mime_type')
+                filename = message[msg_type].get('filename')
                 handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
             return
 
-        # === Unknown employee ===
         if not is_boss and not sender_name:
-            whatsapp_send_text(BOSS_WA_ID, f"⚠️ Unknown sender: {from_msisdn}")
-            whatsapp_send_text(from_msisdn, "Aap system me map nahi hain. Meharbani apna naam batayein.")
+            # Unknown sender, ask for clarification
+            whatsapp_send_text(BOSS_WA_ID, f"Unknown sender {from_msisdn}. Please map this number to a name for best experience.")
+            whatsapp_send_text(from_msisdn, "Aapka number system me map nahi hai. Meharbani se apna naam confirm karein.")
             return
 
-        # === Boss message ===
         if is_boss:
-            if msg_type == "text":
-                handle_boss_command(message["text"]["body"], from_msisdn)
-                if get_voice_arm_state().get("armed"):
+            if msg_type == 'text':
+                text = message['text']['body']
+                handle_boss_command(text, from_msisdn)
+                voice_arm_state = get_voice_arm_state()
+                if voice_arm_state.get("armed"):
                     set_voice_arm_state(False)
-            elif msg_type in ["image", "document", "audio", "voice"]:
-                if msg_type == "voice":
-                    msg_type = "audio"
-                medi_id = message[msg_type]["id"]
-                mime_type = message[msg_type].get("mime_type")
-                filename = message[msg_type].get("filename")
+            elif msg_type in ['image', 'document', 'audio', 'voice']:
+                if msg_type == 'voice':
+                    msg_type = 'audio'
+                medi_id = message[msg_type]['id']
+                mime_type = message[msg_type].get('mime_type')
+                filename = message[msg_type].get('filename')
                 handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
+        elif msg_type in ['image', 'document', 'audio', 'voice']:
+            # Normalize voice/audio types
+            if msg_type == 'voice':
+                msg_type = 'audio'  # Treat voice as audio for processing
+            
+            medi_id = message[msg_type]['id']
+            mime_type = message[msg_type].get('mime_type')
+            filename = message[msg_type].get('filename')
+            handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
+            
+            # Check if boss sent audio and voice arm is active
+            if is_boss and msg_type == 'audio':
+                voice_arm_state = get_voice_arm_state()
+                if voice_arm_state.get("armed") and voice_arm_state.get("targets"):
+                    # Download the audio first
+                    date_str = datetime.now().strftime("%Y-%m-%d")
+                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    media_dir = STORAGE_PATHS["media"] / "boss" / date_str
+                    file_path = wa_download_media(medi_id, media_dir / f"boss_audio_{ts_str}.ogg")
+                    
+                    if file_path:
+                        targets = voice_arm_state["targets"]
+                        sent_names = []
+                        skip_names = []
+                        
+                        for target_name in targets:
+                            if target_name in employees:
+                                result = wa_send_audio(employees[target_name]["msisdn"], file_path, mark_as_voice=True)
+                                if result["ok"]:
+                                    sent_names.append(target_name)
+                                else:
+                                    skip_names.append(f"{target_name} (send fail)")
+                            else:
+                                skip_names.append(f"{target_name} (map nahi mila)")
+                        
+                        # Send confirmation and disarm
+                        if sent_names:
+                            whatsapp_send_text(from_msisdn, f"Voice routing OFF. Bhej diya: {', '.join(sent_names)}.")
+                        
+                        if skip_names:
+                            whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
+                        
+                        set_voice_arm_state(False)
+                    else:
+                        whatsapp_send_text(from_msisdn, "Voice routing fail. Audio download nahi hua.")
+                        set_voice_arm_state(False)
 
 
 
@@ -2649,5 +2580,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

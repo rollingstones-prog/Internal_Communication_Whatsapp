@@ -232,8 +232,15 @@ def get_employee_chat(employee: str):
         emp_name = (e.get("employee") or e.get("to") or "").lower()
         if emp_name != employee.lower():
             continue
+        if kind == "BOSS_INTENT":
+            chat.append({
+                "sender": "Boss",
+                "type": "text",
+                "text": e.get("text"),
+                "timestamp": e.get("timestamp")
+            })
 
-        # ---- Agent → Employee ----
+            # ---- Agent → Employee ----
         if kind == "WA_SEND":
             chat.append({
                 "sender": "Agent",
@@ -363,4 +370,5 @@ async def upload_file(file: UploadFile = File(...)):
     supabase.table("events").insert(record).execute()
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+
 

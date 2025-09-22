@@ -143,56 +143,56 @@ def stt_from_audio(audio_path: Path):
         return "Audio transcription me temporary issue hai."
 
 @app.get("/chats/all")
-def get_all_chats():
-    events = read_events()
+def get_all_chats(limit: int = 200):
+    """
+    Returns summary of all chats including:
+    - Last message from Employee, Agent, or Boss
+    - Handles text, media, and files
+    - Always picks the most recent message per employee
+    """
+    events = read_events(limit=limit)
     employees = {}
 
     for e in events:
         kind = e.get("kind")
-        if kind not in ["WA_SEND", "WA_RECV"]:
-            continue   # ✅ sirf Agent/Employee msgs lo
-
         emp_name = e.get("employee") or e.get("to")
         msisdn = e.get("msisdn")
         if not emp_name:
             continue
 
-        last_msg, last_ts = None, None
+        last_msg, last_ts, sender, msg_type = None, None, None, "text"
+
+        # ---- Boss → Agent/Employee ----
+        if kind == "BOSS_INTENT":
+            sender = "Boss"
+            last_msg = e.get("text") or "📝 Boss command"
+            last_ts = e.get("timestamp") or e.get("at")
 
         # ---- Agent → Employee ----
-        if kind == "WA_SEND":
-            last_msg = e.get("payload", {}).get("text", {}).get("body") or "📎 Media"
+        elif kind == "WA_SEND":
+            sender = "Agent"
+            payload = e.get("payload", {})
+            msg_type = payload.get("type", "text")
+            last_msg = payload.get("text", {}).get("body") or "📎 Media"
             last_ts = e.get("at")
-
-            # ✅ sirf tab save karo jab employee ne abhi tak reply nahi kiya
-            if emp_name not in employees:
-                employees[emp_name] = {
-                    "name": emp_name,
-                    "msisdn": msisdn,
-                    "lastMessage": last_msg or "No message",
-                    "lastTimestamp": last_ts,
-                    "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
-                    "online": True
-                }
 
         # ---- Employee → Agent ----
         elif kind == "WA_RECV":
+            sender = "Employee"
             payload = e.get("payload", {})
 
-            # Case 1: Direct text payload
             if isinstance(payload, dict) and "text" in payload:
+                msg_type = "text"
                 last_msg = payload.get("text", {}).get("body")
                 last_ts = e.get("at")
 
-            # Case 2: Direct messages list
-            elif "messages" in payload:
+            elif "messages" in payload:  # direct list
                 m = payload["messages"][-1]
                 msg_type = m.get("type")
                 last_msg = m.get("text", {}).get("body") if msg_type == "text" else "📎 Media"
                 last_ts = m.get("timestamp")
 
-            # Case 3: Webhook nested entry → changes → value → messages
-            elif "entry" in payload:
+            elif "entry" in payload:  # nested webhook
                 for entry in payload.get("entry", []):
                     for change in entry.get("changes", []):
                         for m in change.get("value", {}).get("messages", []):
@@ -200,17 +200,34 @@ def get_all_chats():
                             last_msg = m.get("text", {}).get("body") if msg_type == "text" else "📎 Media"
                             last_ts = m.get("timestamp")
 
-            # ✅ Always overwrite with employee ka msg (latest priority)
+        # Skip if still nothing parsed
+        if not last_msg:
+            continue
+
+        # ✅ Update only if:
+        # 1. Employee is new
+        # 2. Or new message is more recent
+        if emp_name not in employees or (last_ts and last_ts > employees[emp_name]["lastTimestamp"]):
             employees[emp_name] = {
                 "name": emp_name,
                 "msisdn": msisdn,
-                "lastMessage": last_msg or "No message",
+                "lastMessage": last_msg,
                 "lastTimestamp": last_ts,
+                "lastSender": sender,
+                "lastType": msg_type,
                 "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
                 "online": True
             }
 
-    return {"employees": list(employees.values())}
+    # ✅ sort by latest timestamp
+    sorted_employees = sorted(
+        employees.values(),
+        key=lambda x: x["lastTimestamp"] or "",
+        reverse=True
+    )
+
+    return {"employees": sorted_employees}
+
 
 
 
@@ -224,29 +241,45 @@ def find_employee_name_by_msisdn(msisdn: str):
 
 @app.get("/chats/{employee}")
 def get_employee_chat(employee: str):
+    """
+    Get full chat history for a specific employee or boss number.
+    Handles:
+    - Boss messages (BOSS_INTENT)
+    - Agent messages (WA_SEND)
+    - Employee messages (WA_RECV)
+    Supports text, media, files with timestamps.
+    """
     events = read_events()
     chat = []
 
     for e in events:
         kind = e.get("kind")
         emp_name = (e.get("employee") or e.get("to") or "").lower()
-        if emp_name != employee.lower():
+        msisdn = (e.get("msisdn") or "").lower()
+
+        # Check if this event belongs to the requested employee
+        if employee.lower() not in [emp_name, msisdn]:
             continue
+
+        # ---- Boss → Agent/Employee ----
         if kind == "BOSS_INTENT":
             chat.append({
                 "sender": "Boss",
                 "type": "text",
-                "text": e.get("text"),
-                "timestamp": e.get("timestamp")
+                "text": e.get("text") or (e.get("payload") or {}).get("text"),
+                "filename": None,
+                "timestamp": e.get("timestamp") or e.get("at")
             })
 
-            # ---- Agent → Employee ----
-        if kind == "WA_SEND":
+        # ---- Agent → Employee ----
+        elif kind == "WA_SEND":
+            payload = e.get("payload", {})
+            msg_type = payload.get("type", "text")
             chat.append({
                 "sender": "Agent",
-                "type": e.get("payload", {}).get("type", "text"),
-                "text": e.get("payload", {}).get("text", {}).get("body"),
-                "filename": e.get("payload", {}).get("filename"),
+                "type": msg_type,
+                "text": payload.get("text", {}).get("body") if msg_type == "text" else None,
+                "filename": payload.get("filename") if msg_type in ["document", "image", "audio"] else None,
                 "timestamp": e.get("at")
             })
 
@@ -272,7 +305,7 @@ def get_employee_chat(employee: str):
                         "sender": "Employee",
                         "type": msg_type,
                         "text": m.get("text", {}).get("body") if msg_type == "text" else None,
-                        "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document","image","audio"] else None,
+                        "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document", "image", "audio"] else None,
                         "timestamp": m.get("timestamp")
                     })
 
@@ -286,17 +319,18 @@ def get_employee_chat(employee: str):
                                 "sender": "Employee",
                                 "type": msg_type,
                                 "text": m.get("text", {}).get("body") if msg_type == "text" else None,
-                                "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document","image","audio"] else None,
+                                "filename": m.get(msg_type, {}).get("filename") if msg_type in ["document", "image", "audio"] else None,
                                 "timestamp": m.get("timestamp")
                             })
 
-    # ✅ sort by time
+    # ✅ Sort messages by timestamp (ascending order)
     chat = sorted(chat, key=lambda x: x.get("timestamp") or "")
 
     return {
         "employee": employee,
         "messages": chat
     }
+
 
 def append_event(record: dict):
     print("👉 append_event called with:", record)   # Debug
@@ -370,5 +404,6 @@ async def upload_file(file: UploadFile = File(...)):
     supabase.table("events").insert(record).execute()
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
+
 
 

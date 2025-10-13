@@ -1,354 +1,227 @@
-# --- ElevenLabs API Integration ---
-from fastapi import FastAPI
-import supabase
-from supabase_functions import create_client
-from dashboard_api import find_employee_name_by_msisdn
-from elevenlabs_api import tts_to_mp3 , stt_from_mp3
-# WhatsApp Lead Agent Bot (Single File)
-#
-# SETUP NOTES:
-# 1. .env file me yeh values daalein:
-#    WA_TOKEN=EAAG...                 # WhatsApp access token
-#    WA_PHONE_ID=728827243646756      # aapka WA phone number ID
-#    BOSS_WA_ID=9232XXXXXXXXX         # boss ka WhatsApp number, country code ke sath, '+' ke bina
-#    VERIFY_TOKEN=abc                 # jo aap webhook verify me daloge
-#    OPENAI_API_KEY=sk-...            # OpenAI key
-#    FOLLOWUP_MINUTES=30              # default one-time follow-up
-#    GOOGLE_API_KEY=AIza...           # Gemini API key
-#    GEMINI_TEXT_MODEL=gemini-1.5-pro # Gemini text model
-#    GEMINI_VISION_MODEL=gemini-1.5-pro # Gemini vision model
-#    DELIVERY_DEFAULT=auto            # text | voice | auto
-#
-# 2. employees.json banayein (example):
-#    {"Ali": {"msisdn": "923001234567", "pref": "text"}, "Sara": {"msisdn": "923331234567", "pref": "voice"}, "Bilal": {"msisdn": "923451234567", "pref": "auto"}}
-#
-# 3. Dependencies install karein (uv se):
-#    uv add python-dotenv openai pdfminer.six reportlab pillow imageio-ffmpeg pydub audioop-lts requests google-generativeai
-#
-# 4. WhatsApp App me webhook URL set karein (e.g., with ngrok):
-#    Callback URL: https://<your-ngrok-subdomain>.ngrok-free.app/webhook
-#    Verify Token: abc (same as .env)
-#
-# FEATURES:
-# - Boss commands: @tasks/@send, reports (text/pdf/voice), employee mapping
-# - Employee updates: Done/Delay commands with progress tracking
-# - AI analysis: Images, PDFs, voice transcription
-# - Delivery preferences: text/voice/auto per employee
-# - Voice forwarding: Forward last voice notes to boss
-# - Debouncing: Prevents duplicate webhook processing
-# - Professional Roman-Urdu messaging
-
-
+from fastapi import FastAPI, Request, Response, HTTPException
 import os
-import warnings
-
-
-# --- Standard Library Imports ---
 import json
-import http.server
-import socketserver
-import threading
-import base64
+import time
+import warnings
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 import re
-from urllib.parse import urlparse, parse_qs
-
-# --- Third-party Imports ---
-import requests
-from openai import OpenAI
-from pdfminer.high_level import extract_text
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
+import io
+import threading
+from PIL import Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-from PIL import Image
-import google.generativeai as genai
-import io
-import time
-from dotenv import load_dotenv
-load_dotenv(override=True)
-# --- Global Configuration & Constants ---
-PORT = 8000
-HOST = "0.0.0.0"
+import logging
+import requests
+import mimetypes
 
-
-# Professional Roman-Urdu Phrases
-PHRASES = {
-    "emp_ack": "Update receive ho gaya. Shukriya.",
-    "done_ack": "Update note kar liya. Shukriya.",
-    "delay_ack": "Delay note kar liya hai."
-}
-
-# Environment Variables
-WA_TOKEN = os.getenv("WA_TOKEN")
-print(WA_TOKEN)
-WA_PHONE_ID = os.getenv("WA_PHONE_ID")
-BOSS_WA_ID = os.getenv("BOSS_WA_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
-DELIVERY_DEFAULT = os.getenv("DELIVERY_DEFAULT", "auto")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Import local DB helper and ElevenLabs TTS/STT if available
 try:
-    FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", 30))
-except ValueError:
-    FOLLOWUP_MINUTES = 30
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    from db import init_db, close_engine
+except Exception:
+    # init_db placeholder will be defined later if import fails
+    init_db = None
+    close_engine = None
 
-app = FastAPI()
+try:
+    from elevenlabs_api import tts_to_mp3, stt_from_mp3
+except Exception:
+    tts_to_mp3 = None
+    stt_from_mp3 = None
 
-@app.get("/webhook")
-async def verify(request: requests.Request):
-    params = dict(request.query_params)
-    if (
-        params.get("hub.mode") == "subscribe"
-        and params.get("hub.verify_token") == VERIFY_TOKEN
-    ):
-        return int(params["hub.challenge"])
-    return "Verification failed"
-
-# ------------------------
-# POST /webhook (Incoming WA Msgs)
-# ------------------------
-@app.post("/webhook")
-async def webhook(request: requests.Request):
-    data = await request.json()
-    print("📩 Incoming WhatsApp:", data)
-
-    msg_text = None
-    from_msisdn = None
+# PDF text extractor: prefer pdfminer, fall back to PyPDF2 or noop
+try:
+    from pdfminer.high_level import extract_text as extract_text
+except Exception:
     try:
-        entry = data.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
-        value = change.get("value", {})
-        messages = value.get("messages", [])
-        contacts = value.get("contacts", [])
-        if messages:
-            msg_text = messages[0].get("text", {}).get("body")
-            from_msisdn = contacts[0].get("wa_id")  # sender ka number
-    except Exception as e:
-        print("⚠️ Parsing error:", e)
-
-    # ✅ Save to Supabase
-    try:
-        record = {
-            "topic": "whatsapp",
-            "extension": "incoming",
-            "payload": data,
-            "event": msg_text or "event",
-            "private": False,
-            "inserted_at": datetime.utcnow().isoformat()
-        }
-        supabase.table("messages").insert(record).execute()
-        print("✅ Inserted into Supabase:", record)
-    except Exception as e:
-        print("❌ Supabase insert error:", e)
-
-    # ✅ Yahan se reply bhejna hoga
-    if msg_text and from_msisdn:
-        # If it's a boss message, call the boss command handler
-        if from_msisdn == BOSS_WA_ID:
-            handle_boss_command(msg_text, from_msisdn)  # Call to handle boss's command
-
-        reply_text = f"Apka message mila: {msg_text}"
-        whatsapp_send_text(from_msisdn, reply_text)
-
-    return {"status": "ok"}
-
-# OpenAI Client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# --- Gemini (primary) + GPT-4o (fallback) router ---
-class ModelRouter:
-    def __init__(self, openai_client):
-        self.client = openai_client
-        self.google_key = os.getenv("GOOGLE_API_KEY") or ""
-        self.gemini_text = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro")
-        self.gemini_vision = os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
-        if self.google_key:
-            genai.configure(api_key=self.google_key)
-
-    # ---- Gemini helpers ----
-    def _gemini_text(self, prompt: str) -> str:
-        if not self.google_key:
-            raise RuntimeError("No GOOGLE_API_KEY")
-        m = genai.GenerativeModel(self.gemini_text)
-        r = m.generate_content(prompt)
-        return (getattr(r, "text", "") or "").strip()
-
-    def _gemini_vision(self, prompt: str, image_bytes: bytes, mime="image/jpeg") -> str:
-        if not self.google_key:
-            raise RuntimeError("No GOOGLE_API_KEY")
-        m = genai.GenerativeModel(self.gemini_vision)
-        r = m.generate_content([prompt, {"mime_type": mime, "data": image_bytes}])
-        return (getattr(r, "text", "") or "").strip()
-
-    # ---- OpenAI helpers (fallbacks) ----
-    def _gpt_text(self, sys: str, user: str, model="gpt-4o") -> str:
-        r = self.client.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-            max_tokens=800,
-        )
-        return r.choices[0].message.content.strip()
-
-    def _gpt_vision(self, sys: str, image_bytes: bytes) -> str:
-        data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("utf-8")
-        r = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role":"system","content":sys},
-                {"role":"user","content":[
-                    {"type":"text","text":"Image analysis please."},
-                    {"type":"image_url","image_url":{"url":data_url}}
-                ]}
-            ],
-            max_tokens=600
-        )
-        return r.choices[0].message.content.strip()
-
-    # ---- Public API ----
-    def summarize_text(self, sys_style: str, user_prompt: str) -> str:
-        try:
-            return self._gemini_text(f"{sys_style}\n\n{user_prompt}")
-        except Exception:
+        import PyPDF2
+        def extract_text(path):
             try:
-                return self._gpt_text(sys_style, user_prompt, model="gpt-4o")
+                with open(path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    texts = [p.extract_text() or "" for p in reader.pages]
+                    return "\n".join(texts)
             except Exception:
-                return "Temporary analysis issue."
+                return ""
+    except Exception:
+        def extract_text(path):
+            return ""
 
-    def summarize_pdf_text(self, sys_style: str, pdf_text: str) -> str:
-        chunk = pdf_text[:12000]
-        try:
-            return self._gemini_text(f"{sys_style}\n\n{chunk}")
-        except Exception:
-            try:
-                return self._gpt_text(sys_style, chunk, model="gpt-4o")
-            except Exception:
-                return "Temporary PDF analysis issue."
-
-    def analyze_image(self, sys_style: str, image_bytes: bytes) -> str:
-        try:
-            return self._gemini_vision(sys_style, image_bytes)
-        except Exception:
-            try:
-                return self._gpt_vision(sys_style, image_bytes)
-            except Exception:
-                return "Temporary image analysis issue."
-
-ROUTER = ModelRouter(client)
-from openai import agents
-def test_openai_agent():
-    """This Python File and all system uses open ai agents sdk>>   Ths ystem and file fullyb integrated with open ai agents sdk """
-    try:
-        # Minimal dummy agent (for demonstration only)
-        agent = agents.Agent(name="demo-agent", instructions="Reply in short Roman Urdu.")
-        result = agent.run("System check?")
-        print("Agents SDK test response:", result.output_text)
-    except Exception as e:
-        print("Agents SDK not fully configured:", e)
 load_dotenv(override=True)
-# Prompts
-GLOBAL_STYLE = "Roman Urdu (Karachi), short & professional. Sirf kaam ki baat. Over-explain nahi. Agar info na mile to seedha keh do."
-IMG_PROMPT = "Is tasveer ki seedhi analysis Roman-Urdu me bullets (max 10) likho. Agar text/404/UX issues nazar aayen to mention karo. Tone simple."
-PDF_PROMPT = "Roman-Urdu me chhoti summary 3 headings me do: Summary / Action Items / Risks. Sirf kaam ki baat."
-TEXT_PROMPT = "Boss ke sawal ka seedha jawab 1 2 lines me. Agar info na ho to batao aur ek clear next step suggest karo."
-VOICE_PROMPT = """Transcript ko dekho aur short bullets me likho ke banda kya keh raha hai.
-Sirf uske content ka analysis karo (kya bola, kya demand thi, kya issue tha).
-Reply ya acknowledgement mat likho.
-Roman Urdu me 3–5 simple lines likho.."""
+app = FastAPI()
+# FastAPI app instance
 
-# File Paths
+
+# Environment
+WA_TOKEN = os.getenv("WA_TOKEN")
+WA_PHONE_ID = os.getenv("WA_PHONE_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+BOSS_WA_ID = os.getenv("BOSS_WA_ID")
+
+# Storage paths
 STORAGE_PATHS = {
     "employees": Path("./employees.json"),
     "tasks": Path("./tasks.jsonl"),
     "events": Path("./events.jsonl"),
-    "reports": Path("./reports/"),
-    "reports_out": Path("./reports/out/"),
-    "media": Path("./media/"),
-    "seen_ids": Path("./.seen_ids.json"),
-    "last_voice": Path("./last_voice.json"),
-    "voice_arm": Path("./voice_arm.json")
+    "seen_ids": Path("./seen_ids.json"),
+    "media": Path("./media"),
+    "reports": Path("./reports"),
+    "reports_out": Path("./reports_out"),
+    "voice_arm": Path("./voice_arm.json"),
 }
 
 # In-memory state
-CAPTURE_STATE = {"on": False, "name": None, "buffer": []}
+SEEN_MESSAGE_IDS = set()
+EMP_PENDING = {}
+BOSS_PENDING = {}
+FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", "30"))
 FOLLOWUP_TIMERS = {}
-LAST_MEDIA = {"type": None, "id": None, "filename": None, "sender": None}
-SEEN_MESSAGE_IDS = set()  # Track seen message IDs for debouncing
+CAPTURE_STATE = {"on": False, "name": None, "buffer": [], "multi": False, "targets": []}
+LAST_MEDIA = {"type": None}
+ROUTER = None
+GLOBAL_STYLE = ""
+VOICE_PROMPT = ""
+IMG_PROMPT = ""
+PDF_PROMPT = ""
 
-# Pending analysis state for boss reply-driven workflows
-BOSS_PENDING = {
-    "active": False,
-    "awaiting_format": False,
-    "kind": None,           # image | pdf | document | audio | text
-    "employee": None,
-    "path": None,
-    "filename": None,
-    "text": None,           # for text updates
-    "transcript": None,     # for audio
-    "summary": None,        # prepared analysis summary
-    "ts": 0
-}
-# Employee-side pending analysis (per-employee)
-EMP_PENDING = {}  # { "Hafiz": {"active": True, "items": {"text": "...", "images": [Path..], "docs": [Path..], "audio": [Path..]}} }
+# If DB init wasn't imported, provide a minimal async stub so startup won't crash.
+if init_db is None:
+    async def init_db():
+        return True
 
-LAST_INSTRUCTION_PATH = Path("./reports/last_instruction.json")
+# If ElevenLabs functions aren't available, provide safe stubs.
+if tts_to_mp3 is None:
+    def tts_to_mp3(text, out_path, voice_id=None):
+        # noop fallback: write simple TTS-like placeholder file if path is provided
+        try:
+            p = Path(out_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(b"")
+            return p
+        except Exception:
+            return None
 
-def update_last_instruction(name):
-    """Update last instruction timestamp for employee."""
-    try:
-        if LAST_INSTRUCTION_PATH.exists():
-            data = json.load(LAST_INSTRUCTION_PATH.open("r", encoding="utf-8"))
-        else:
-            data = {}
-        data[name] = now_iso()
-        LAST_INSTRUCTION_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+if stt_from_mp3 is None:
+    def stt_from_mp3(audio_path):
+        return ""
 
-def get_last_instruction(name):
-    """Get last instruction timestamp for employee."""
-    try:
-        if LAST_INSTRUCTION_PATH.exists():
-            data = json.load(LAST_INSTRUCTION_PATH.open("r", encoding="utf-8"))
-            return data.get(name)
-    except Exception:
-        pass
-    return None
+# Lightweight fallback AI router to avoid AttributeError when ROUTER isn't configured.
+class _FallbackRouter:
+    def analyze_image(self, prompt, img_bytes):
+        return "Image analysis unavailable (no AI configured)."
+    def summarize_pdf_text(self, prompt, text):
+        t = text or ""
+        return (t[:800] + "...") if len(t) > 800 else (t or "No text to summarize.")
+    def summarize_text(self, prompt, text):
+        t = text or ""
+        return (t[:800] + "...") if len(t) > 800 else (t or "No text to summarize.")
+    def analyze(self, prompt, text):
+        return self.summarize_text(prompt, text)
 
-# --- File & Directory Setup ---
+# Ensure ROUTER is set to a fallback if not provided by the runtime.
+if ROUTER is None:
+    ROUTER = _FallbackRouter()
+
+
 def setup_storage():
-    """Create necessary files and directories if they don't exist."""
-    for path in STORAGE_PATHS.values():
-        if path.suffix:  # It's a file
-            if not path.parent.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                if path.suffix == ".json":
-                    if path.name == ".seen_ids.json":
-                        path.write_text("[]", encoding="utf-8")
-                    elif path.name == "last_voice.json":
-                        path.write_text("{}", encoding="utf-8")
-                    elif path.name == "voice_arm.json":
-                        path.write_text("{}", encoding="utf-8")
-                    else:
-                        path.write_text("{}", encoding="utf-8")
-                else:
-                    path.touch()
-        else:  # It's a directory
-            path.mkdir(parents=True, exist_ok=True)
-    
-    # Load existing seen message IDs
-    global SEEN_MESSAGE_IDS
+    # Ensure directories and baseline files exist
+    STORAGE_PATHS["media"].mkdir(parents=True, exist_ok=True)
+    STORAGE_PATHS["reports"].mkdir(parents=True, exist_ok=True)
+    STORAGE_PATHS["reports_out"].mkdir(parents=True, exist_ok=True)
+    for key in ("employees", "tasks", "events"):
+        p = STORAGE_PATHS[key]
+        if not p.exists():
+            if p.suffix == ".jsonl":
+                p.write_text("", encoding="utf-8")
+            else:
+                p.write_text("{}" if p.suffix == ".json" else "", encoding="utf-8")
     try:
-        with open(STORAGE_PATHS["seen_ids"], "r", encoding="utf-8") as f:
-            SEEN_MESSAGE_IDS = set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        SEEN_MESSAGE_IDS = set()
+        if STORAGE_PATHS["seen_ids"].exists():
+            with open(STORAGE_PATHS["seen_ids"], "r", encoding="utf-8") as f:
+                ids = json.load(f)
+                if isinstance(ids, list):
+                    SEEN_MESSAGE_IDS.update(ids)
+    except Exception as e:
+        print("Warning: failed to load seen_ids:", e)
+
+
+@app.get("/webhook")
+async def webhook_get(request: Request):
+    # Return the challenge value for webhook verification
+    q = request.query_params
+    if ('hub.mode' in q and 'hub.verify_token' in q and q.get('hub.mode') == 'subscribe' and q.get('hub.verify_token') == VERIFY_TOKEN):
+        return Response(content=q.get('hub.challenge', ''), media_type="text/plain")
+    raise HTTPException(status_code=403)
+
+
+@app.post("/webhook")
+async def webhook_post(request: Request):
+    try:
+        data = await request.json()
+
+        # 1️⃣ Log raw event
+        append_jsonl(STORAGE_PATHS["events"], {"direction": "in", "payload": data})
+
+        # 2️⃣ Extract messages and process
+        if "entry" in data:
+            for entry in data.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    if "messages" in value:
+                        for message in value["messages"]:
+                            process_message(message)
+
+                            sender = message.get("from")
+                            
+                            if "text" in message:
+                                msg_text = message["text"]["body"]
+                            elif "button" in message:
+                                msg_text = f"[Button] {message['button'].get('text')}"
+                            elif "interactive" in message:
+                                msg_text = "[Interactive reply]"
+                            elif "audio" in message:
+                                msg_text = "[Audio message]"
+                            else:
+                                msg_text = "[Unsupported message type]"
+
+                            update_employee_chat(sender, msg_text)
+
+        return {"ok": True}
+
+    except Exception as e:
+        print("❌ Error in webhook_post:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Runtime state placeholders
+FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", "30"))
+FOLLOWUP_TIMERS = {}
+CAPTURE_STATE = {"on": False, "name": None, "buffer": [], "multi": False, "targets": []}
+LAST_MEDIA = {"type": None}
+ROUTER = None             # will hold your AI router / model object later
+GLOBAL_STYLE = ""         # optional prompt prefix
+VOICE_PROMPT = ""         # used by audio summarization
+IMG_PROMPT = ""           # used by analyze_image_with_ai()
+PDF_PROMPT = ""           # used by analyze_pdf_with_ai()
+
+
+# Startup behavior: ensure storage + DB initialized
+@app.on_event("startup")
+async def _app_startup():
+    try:
+        setup_storage()
+        # call imported init_db (may be a stub or the real DB initializer)
+        await init_db()
+    except Exception as e:
+        print("Startup error:", e)
+    print(f"Boss WhatsApp ID: {BOSS_WA_ID}")
+    print("New commands: setboss, map, pref, forward voice, report <Name> voice")
+    print("Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali")
+    print("Voice routing: @voice Hira,Ali (then send audio), transcribe <Name> yes/no")
+    print("Docs: docs, employees")
+    print("NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester.")
 
 def save_seen_message_id(msg_id):
     """Save a message ID to the seen set and persist to disk."""
@@ -681,7 +554,7 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
 
         record = {
             "at": now_iso(),
-            "kind": "WA_SEND"
+            "kind": "WA_SEND" ,
             "employee": emp_name,
             "msisdn": to_msisdn,
             "to": to_msisdn,
@@ -740,20 +613,8 @@ def handle_whatsapp_error(error_info, to_msisdn: str):
     print(f"WA ERROR: {code} / {sub} → {msg}")
 
 def wa_get_media_url(media_id):
+    """Get media metadata url from WhatsApp Graph API (prefer newer v23 endpoint)."""
     url = f"https://graph.facebook.com/v23.0/{media_id}"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json().get("url")
-    except requests.exceptions.RequestException:
-        return None
-
-import requests
-from pathlib import Path
-
-def wa_get_media_url(media_id):
-    url = f"https://graph.facebook.com/v20.0/{media_id}"
     headers = {"Authorization": f"Bearer {WA_TOKEN}"}
     try:
         response = requests.get(url, headers=headers)
@@ -2095,7 +1956,8 @@ def handle_boss_command(text, from_msisdn):
             summary = build_ai_summary_text(name)
             tts_path = STORAGE_PATHS["reports_out"] / f"{name}_report_{datetime.now().strftime('%Y%m%d_%H%M')}.mp3"
             if tts_to_file(summary, tts_path):
-                result = wa_send_audio(from_msisdn, tts_path, mark_as_voice=False)
+                result = wa_send_audio(from_msisdn, media_id=None, link=str(Path(pth)), mark_as_voice=True)
+
                
                 
         return
@@ -2346,240 +2208,78 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
     if ack_msg:
         whatsapp_send_text(from_msisdn, ack_msg)
 
-# --- HTTP Server ---
-class WebhookHandler(http.server.BaseHTTPRequestHandler):
-    def update_employee_chat(self, msisdn, msg_text):
-        """Update employees.json with latest WhatsApp message"""
-        try:
-            import json
-            employees_file = STORAGE_PATHS["employees"]
+# Legacy socketserver-based HTTP handler removed; webhook is served by FastAPI endpoints above.
 
-            if employees_file.exists():
-                with open(employees_file, "r", encoding="utf-8") as f:
-                    employees = json.load(f)
-            else:
-                employees = {}
+async def init_db():
+    """placeholder so startup doesn't crash"""
+    return True
 
-            # Agar employee exist nahi karta, new entry banao
-            if msisdn not in employees:
-                employees[msisdn] = {"msisdn": msisdn, "messages": []}
+def process_message(message: dict):
+    """Handle incoming WhatsApp message and route to correct logic."""
+    try:
+        sender = message.get("from")
+        msg_id = message.get("id")
+        msg_type = message.get("type", "")
+        text = ""
 
-            employees[msisdn]["messages"].append({
-                "timestamp": int(time.time()),
-                "text": msg_text
-            })
-
-            with open(employees_file, "w", encoding="utf-8") as f:
-                json.dump(employees, f, indent=2)
-
-            print(f"✅ Updated chat for {msisdn}: {msg_text}")
-
-        except Exception as e:
-            print("❌ Failed to update employee chat:", e)
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        query = parse_qs(parsed_path.query)
-        
-        if parsed_path.path == "/webhook":
-            if ('hub.mode' in query and 'hub.verify_token' in query and
-                    query['hub.mode'][0] == 'subscribe' and
-                    query['hub.verify_token'][0] == VERIFY_TOKEN):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(query['hub.challenge'][0].encode())
-            else:
-                self.send_response(403)
-                self.end_headers()
+        # Extract text from the message
+        if msg_type == "text":
+            text = message.get("text", {}).get("body", "").strip()
+        elif msg_type == "button":
+            text = message.get("button", {}).get("text", "").strip()
+        elif msg_type == "interactive":
+            text = "[interactive reply]"
+        elif msg_type == "audio":
+            text = "[voice note]"
+        elif msg_type == "image":
+            text = "[image]"
         else:
-            self.send_response(404)
-            self.end_headers()
+            text = "[unsupported message]"
 
-    def do_POST(self):
-        if self.path == "/webhook":
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                post_data = self.rfile.read(content_length)
-                data = json.loads(post_data)
-
-                # 1️⃣ Har event ko raw log me save karo
-                append_jsonl(STORAGE_PATHS["events"], {
-                    "direction": "in",
-                    "payload": data
-                })
-
-                # 2️⃣ WhatsApp message extract karo
-                if "entry" in data:
-                    for entry in data.get("entry", []):
-                        for change in entry.get("changes", []):
-                            value = change.get("value", {})
-                            if "messages" in value:
-                                for message in value["messages"]:
-                                    # Yeh tumhara custom processor
-                                    self.process_message(message)
-
-                                    # 3️⃣ Employee chat me append karo
-                                    sender = message.get("from")   # e.g. "923001234567"
-                                    msg_text = None
-
-                                    if "text" in message:
-                                        msg_text = message["text"]["body"]
-                                    elif "button" in message:
-                                        msg_text = f"[Button] {message['button'].get('text')}"
-                                    elif "interactive" in message:
-                                        msg_text = "[Interactive reply]"
-                                    elif "audio" in message:
-                                        msg_text = "[Audio message]"
-                                    else:
-                                        msg_text = "[Unsupported message type]"
-
-                                    # Save/update employees.json
-                                    self.update_employee_chat(sender, msg_text)
-
-                self.send_response(200)
-                self.end_headers()
-            except Exception as e:
-                print("❌ Error in do_POST:", e)
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def process_message(self, message):
-        from_msisdn = message.get('from')
-        msg_type = message.get('type')
-        msg_id = message.get('id')
-
-        # Debug logging
-        print(f"Message from {from_msisdn}, type: {msg_type}")
-
-        # Check for duplicate messages
+        # Avoid duplicate processing
         if msg_id and is_message_seen(msg_id):
-            print("Duplicate message detected, skipping")
             return
-        
-        # Mark message as seen
         if msg_id:
             save_seen_message_id(msg_id)
 
-        employees = load_employees()
-        sender_name = None
-        sender_info = None
-        for name, info in employees.items():
-            if info["msisdn"] == from_msisdn:
-                sender_name = name
-                sender_info = info
-                break
-        is_boss = (from_msisdn == BOSS_WA_ID)
+        # Check if message is from Boss
+        if sender == BOSS_WA_ID:
+            print(f"📩 Boss message: {text}")
+            handle_boss_command(text, sender)
+        else:
+            # Identify employee name by number
+            employees = load_employees()
+            emp_name = None
+            for name, data in employees.items():
+                if data.get("msisdn") == sender:
+                    emp_name = name
+                    break
 
-        if not is_boss and sender_name:
-            # Always notify boss with mapped name and number
-            
-            # Confirm to employee
-            whatsapp_send_text(from_msisdn, f" {sender_name}, aapka message receive ho gaya hai..")
-            # Proceed with employee message handling
-            if msg_type == 'text':
-                text = message['text']['body']
-                handle_employee_message(text, from_msisdn, sender_name)
-            elif msg_type in ['image', 'document', 'audio', 'voice']:
-                if msg_type == 'voice':
-                    msg_type = 'audio'
-                medi_id = message[msg_type]['id']
-                mime_type = message[msg_type].get('mime_type')
-                filename = message[msg_type].get('filename')
-                handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
-            return
+            if emp_name:
+                print(f"👷 Employee message from {emp_name}: {text}")
+                handle_employee_message(text, sender, emp_name)
+            else:
+                print(f"⚠️ Unknown sender: {sender}")
+                whatsapp_send_text(sender, "Aap system me map nahi hain. Boss se 'map Name <number>' karwayen.")
+                whatsapp_send_text(BOSS_WA_ID, f"New number {sender} ne message bheja. Use map karne ke liye likhein:\nmap Name {sender}")
+    except Exception as e:
+        print(f"❌ Error in process_message: {e}")
 
-        if not is_boss and not sender_name:
-            # Unknown sender, ask for clarification
-            whatsapp_send_text(BOSS_WA_ID, f"Unknown sender {from_msisdn}. Please map this number to a name for best experience.")
-            whatsapp_send_text(from_msisdn, "Aapka number system me map nahi hai. Meharbani se apna naam confirm karein.")
-            return
+def update_employee_chat(sender, msg_text):
+    """placeholder for chat logging"""
+    pass
 
-        if is_boss:
-            if msg_type == 'text':
-                text = message['text']['body']
-                handle_boss_command(text, from_msisdn)
-                voice_arm_state = get_voice_arm_state()
-                if voice_arm_state.get("armed"):
-                    set_voice_arm_state(False)
-            elif msg_type in ['image', 'document', 'audio', 'voice']:
-                if msg_type == 'voice':
-                    msg_type = 'audio'
-                medi_id = message[msg_type]['id']
-                mime_type = message[msg_type].get('mime_type')
-                filename = message[msg_type].get('filename')
-                handle_media(msg_type, medi_id, from_msisdn, "Boss", mime_type, filename)
-        elif msg_type in ['image', 'document', 'audio', 'voice']:
-            # Normalize voice/audio types
-            if msg_type == 'voice':
-                msg_type = 'audio'  # Treat voice as audio for processing
-            
-            medi_id = message[msg_type]['id']
-            mime_type = message[msg_type].get('mime_type')
-            filename = message[msg_type].get('filename')
-            handle_media(msg_type, medi_id, from_msisdn, sender_name, mime_type, filename)
-            
-            # Check if boss sent audio and voice arm is active
-            if is_boss and msg_type == 'audio':
-                voice_arm_state = get_voice_arm_state()
-                if voice_arm_state.get("armed") and voice_arm_state.get("targets"):
-                    # Download the audio first
-                    date_str = datetime.now().strftime("%Y-%m-%d")
-                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    media_dir = STORAGE_PATHS["media"] / "boss" / date_str
-                    file_path = wa_download_media(medi_id, media_dir / f"boss_audio_{ts_str}.ogg")
-                    
-                    if file_path:
-                        targets = voice_arm_state["targets"]
-                        sent_names = []
-                        skip_names = []
-                        
-                        for target_name in targets:
-                            if target_name in employees:
-                                result = wa_send_audio(employees[target_name]["msisdn"], file_path, mark_as_voice=True)
-                                if result["ok"]:
-                                    sent_names.append(target_name)
-                                else:
-                                    skip_names.append(f"{target_name} (send fail)")
-                            else:
-                                skip_names.append(f"{target_name} (map nahi mila)")
-                        
-                        # Send confirmation and disarm
-                        if sent_names:
-                            whatsapp_send_text(from_msisdn, f"Voice routing OFF. Bhej diya: {', '.join(sent_names)}.")
-                        
-                        if skip_names:
-                            whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
-                        
-                        set_voice_arm_state(False)
-                    else:
-                        whatsapp_send_text(from_msisdn, "Voice routing fail. Audio download nahi hua.")
-                        set_voice_arm_state(False)
+# Graceful shutdown: close DB engine if available
+@app.on_event("shutdown")
+async def _app_shutdown():
+    try:
+        if close_engine:
+            await close_engine()
+    except Exception as e:
+        print("Shutdown error:", e)
 
-
-
-def main():
-    global BOSS_WA_ID
-    
-    if not all([WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID]):
-        warnings.warn("Warning: One or more required environment variables (WA_TOKEN, WA_PHONE_ID, BOSS_WA_ID) are missing.")
-    
-    setup_storage()
-    
-    print(f"Boss WhatsApp ID: {BOSS_WA_ID}")
-    print("New commands: setboss, map, pref, forward voice, report <Name> voice")
-    print("Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali")
-    print("Voice routing: @voice Hira,Ali (then send audio), transcribe <Name> yes/no")
-    print("Docs: docs, employees")
-    print("NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester.")
-    
-    with socketserver.TCPServer((HOST, PORT), WebhookHandler) as httpd:
-        print(f"Listening on http://{HOST}:{PORT} (POST/GET /webhook)")
-        httpd.serve_forever()
-
-if __name__ == "__main__":
-    main()
+# Note: legacy socketserver-based main() removed. Run the app with uvicorn:
+#    .venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 
 

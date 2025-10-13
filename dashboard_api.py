@@ -8,22 +8,10 @@ import json
 import os
 import requests
 from dotenv import load_dotenv
-from supabase import create_client
 import os
 from utils import now_iso
-
-
-from supabase import create_client, Client
-from dotenv import load_dotenv
 load_dotenv(override=True)
-# .env file me ye keys honi chahiye:
-# SUPABASE_URL=https://xxxx.supabase.co
-# SUPABASE_KEY=eyJhbGciOi...
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Supabase removed: reading local events file instead
 
 
 # -------------------
@@ -60,16 +48,16 @@ def find_employee_name_by_msisdn(msisdn: str):
             return name
     return msisdn
 def read_events(limit=200):
+    # Read from local events.jsonl (newest last)
     try:
-        # Try with "at" if it exists
-        resp = supabase.table("events").select("*").order("at", desc=True).limit(limit).execute()
-        if resp.data:
-            return resp.data
-        # fallback if at is null/empty
-        resp = supabase.table("events").select("*").limit(limit).execute()
-        return resp.data or []
+        if not EVENTS_FILE.exists():
+            return []
+        lines = EVENTS_FILE.read_text(encoding="utf-8").strip().splitlines()
+        entries = [json.loads(l) for l in lines if l.strip()]
+        # return last `limit` entries in reverse chronological order
+        return list(reversed(entries))[:limit]
     except Exception as e:
-        print(f"❌ Supabase read error: {e}")
+        print(f"❌ Local events read error: {e}")
         return []
 
 # -------------------
@@ -294,10 +282,12 @@ def get_employee_chat(employee: str):
 def append_event(record: dict):
     print("👉 append_event called with:", record)   # Debug
     try:
-        resp = supabase.table("events").insert(record).execute()
-        print("👉 Supabase response:", resp)
+        # append to local events.jsonl
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print("👉 Appended event locally")
     except Exception as e:
-        print(f"❌ Supabase insert error: {e}")
+        print(f"❌ Local event append error: {e}")
 
 
 @app.post("/send")
@@ -313,7 +303,9 @@ async def send_message(request: Request):
         "at": datetime.utcnow().isoformat(),
         "payload": {"text": {"body": message.get("text")}, "type": message.get("type", "text")}
     }
-    supabase.table("events").insert(record).execute()
+    # append to local events.jsonl
+    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return {"status": "ok", "saved": record}
 
@@ -360,7 +352,8 @@ async def upload_file(file: UploadFile = File(...)):
         "path": str(file_path),
         "at": datetime.utcnow().isoformat(),
     }
-    supabase.table("events").insert(record).execute()
+    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return {"status": "ok", "file": file.filename, "path": str(file_path)}
 

@@ -1,0 +1,81 @@
+# =========================
+# Python-specific ignores
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# =========================
+# Virtual environments
+# =========================
+.env/
+.venv/
+venv/
+ENV/
+env.bak/
+env/
+
+# =========================
+# VSCode & IDE folders
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Logs & cache
+# =========================
+*.log
+*.tmp
+*.cache
+*.bak
+*.swp
+
+# =========================
+# Local databases & JSON
+# =========================
+*.db
+*.sqlite3
+*.sqlite
+seen_ids.json
+employees.json
+events.json
+tasks.json
+last_voice.json
+voice_arm.json
+dashboard_api.json
+
+# =========================
+# Media & Uploads
+# =========================
+/media/
+/uploads/
+/reports/
+
+# =========================
+# Environment & secrets
+# =========================
+.env
+.env.local
+.env.production
+.env.development
+
+# =========================
+# Python dependency lock files
+# =========================
+Pipfile.lock
+poetry.lock
+uv.lock
+
+# =========================
+# System & OS
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini

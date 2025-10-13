@@ -54,6 +54,34 @@
       "type": "text",
       "text": ".",
       "ts": "2025-09-14T12:44:15.031690"
+    },
+    {
+      "from": "Boss",
+      "header": "BOSS -> EMPLOYEE (forwarded instruction)",
+      "type": "text",
+      "text": "hello Asharib",
+      "ts": "2025-10-11T16:36:49.730367"
+    },
+    {
+      "from": "Employee",
+      "header": "EMPLOYEE -> UPDATE",
+      "type": "text",
+      "text": ".",
+      "ts": "2025-10-11T16:37:51.379867"
+    },
+    {
+      "from": "Boss",
+      "header": "BOSS -> EMPLOYEE (forwarded instruction)",
+      "type": "text",
+      "text": "hello Asharib2",
+      "ts": "2025-10-11T16:38:13.063157"
+    },
+    {
+      "from": "Boss",
+      "header": "BOSS -> EMPLOYEE (forwarded instruction)",
+      "type": "text",
+      "text": "hello\n@@send\n@task Fahad\nFahad ! Direct 5 Star Jao.Daily Recovery Calling Sheet send kro.Asim NEW PORTAL per Calls & payments Krwao.Sab ko  Relocate ka inform kro & Daily payments krwao. without payment Aap ka Regular ZERO DAy  hy.\n\nCVS CHECK KRKY INTERVIEW PER BULAO & CVS STUDY KRKY Trial per Aany walo ko Test & SEO,Web Designer,Graphic Designer,AUTOMATION STAFF HIRE KRKY DO.\n\n&\n\nAsharib & Umamma AI Project mei remaining Work Final & Backend/Frontend ka finishing work Amaan/Shazaib sy & UI/UX Summaya sy Final krwao.Aaj internal Office Project ka Aapny kaam final/Aapny Project ky Msgs ky Mutabiq sab Staff ky Mobile # sy msgs krky confirm krlo.\n\nOptin waly clients & Sukkur/Mehak Clients ko sms Caster ky Jaisy Wati waly Whatsapp Api # per add krdo & Haadi sy Kal wale Emails ka reply/ Whatsapp Sales Campaign Test krwao.\n\n&\n\nZoho mei Modules change/seprate kro.Applo,Lusha & Phantom Buster sy seprately FB,INSTA,YOUTUBE,TWITTER PER SALES POST & SALES MSG send KRO & B2B Websites & LINKED IN per Sales Campaign sy EMAILS/Sles msgs deliver & sab ke daily Quantity msg kro.\n\nSystem ya Cloud Crash hoota hy tu hoony do.Chat gpt ya GOT API sy Oracle software System ke Admin ID ko online Portal ya Web link sy Hack krky Wati wale Whatsapp Api KEY SET & Clients ko Whatsapp per Payment ky msg send kro,Wati sy templet already approved hy.\n\n&\n\nAsharib ky Mutabiq,Reveliance Ai Ka ready Made Ai Call Support Agent Banaya hy prototype meh But Actuall Working Meh nahi Laya lkin Intermediate idea Hugya hy 1 din meh built Hujayga ye\n\nAsharib ko REVILANCE AI  ACCESS dydo & Asharib ky saath ya Khud PAHLY CUSTOMER SUPPORT & ORIGNAL AI CALL CENTRE BASES ON REVILIANCE AI UPTO 1,000 USERS PER DAY Final krlo.\n\nPhr IP CALL CENTRE & NEW PROGECT & AI Call Centre ka ready made limited 50-100 Calls per day ka IP Telephonic communication setup ON ISP per Work START kro.\n\nZayam sy Cash in hand lylo & stationary buy krwalo.\n@send l",
+      "ts": "2025-10-11T16:53:07.079528"
     }
   ]
 }

@@ -148,7 +148,20 @@ def setup_storage():
         print("Warning: failed to load seen_ids:", e)
 
 
+
 @app.get("/webhook")
+async def webhook_get(request: Request):
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("✅ Webhook verified successfully!")
+        return Response(content=challenge, media_type="text/plain", status_code=200)
+    else:
+        print("❌ Webhook verification failed.")
+        raise HTTPException(status_code=403, detail="Verification failed")@app.get("/webhook")
 async def webhook_get(request: Request):
     # Return the challenge value for webhook verification
     q = request.query_params
@@ -2280,6 +2293,7 @@ async def _app_shutdown():
 
 # Note: legacy socketserver-based main() removed. Run the app with uvicorn:
 #    .venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
 

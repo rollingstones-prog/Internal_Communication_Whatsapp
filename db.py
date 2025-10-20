@@ -12,14 +12,13 @@ from sqlalchemy import Integer, String, Text, Boolean, DateTime, select, update
 from sqlalchemy.sql import func
 from dotenv import load_dotenv # <-- Zaroori Import
 
-# Load environment variables (Render par yeh zyada zaroori nahi, lekin local testing ke liye achha hai)
+# Load environment variables (Local testing ke liye)
 load_dotenv(override=True)
 
 # 🛑 CRITICAL FIX: DATABASE_URL ko Environment Variable se load karein
-# Agar DATABASE_URL set hai (PostgreSQL), toh woh use hoga.
+# Agar DATABASE_URL set hai (PostgreSQL URL), toh woh use hoga.
 # Agar set nahi hai, toh yeh SQLite par fallback karega.
-# NOTE: Ab yeh line PostgreSQL URL (jo aapne set kiya hai) use karegi.
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db") 
 
 Base = declarative_base()
 engine: Optional[AsyncEngine] = None
@@ -70,12 +69,12 @@ class WhatsAppInbox(Base):
 
 
 # ───────────────────────────────────────────
-# CONNECTION + HELPERS (Yeh Hissa Wahi Rahega)
+# CONNECTION + HELPERS
 # ───────────────────────────────────────────
 async def get_engine() -> AsyncEngine:
     global engine
     if engine is None:
-        # Ab yeh line sahi DATABASE_URL (Postgres) use karegi
+        # Ab yeh line Render Environment se PostgreSQL URL use karegi
         engine = create_async_engine(DATABASE_URL, echo=False, future=True)
     return engine
 
@@ -137,11 +136,12 @@ async def get_new_messages():
         result = await session.execute(
             select(WhatsAppInbox).where(WhatsAppInbox.processed == False))
         rows = result.scalars().all()
+        # NOTE: dashboard_api.py ko 'created_at' ki zaroorat hai, isliye isko add kiya gaya hai.
         return [{
             "inbox_id": r.id,
             "phone": r.phone,
             "message_text": r.message_text,
-            "at": r.created_at # Add created_at for dashboard_api
+            "at": r.created_at 
         } for r in rows]
 
 

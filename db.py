@@ -9,8 +9,6 @@ import os
 import requests
 from dotenv import load_dotenv
 
-# 🛑 CRITICAL FIX: db.py se zaroori async functions aur models import kiye
-from db import get_new_messages, get_session, Employee 
 
 
 # .env file load karein (Agar local development mein hain)
@@ -276,3 +274,4 @@ async def speech_to_text(file: UploadFile = File(...)):
         f.write(await file.read())
     text = stt_from_audio(audio_path)
     return {"text": text}
+

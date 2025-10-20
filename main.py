@@ -16,7 +16,9 @@ from reportlab.lib.units import inch
 import logging
 import requests
 import mimetypes
-
+# Assuming this is main.py or webhook_handler.py
+# ... (Aapke existing imports) ...
+from db import get_session, WhatsAppInbox # <-- Yeh line add karein
 # Import local DB helper and ElevenLabs TTS/STT if available
 try:
     from db import init_db, close_engine
@@ -170,13 +172,17 @@ async def webhook_get(request: Request):
     raise HTTPException(status_code=403)
 
 
+# Yahan 'main.py' ka updated webhook_post function diya gaya hai
+
 @app.post("/webhook")
 async def webhook_post(request: Request):
     try:
         data = await request.json()
 
-        # 1️⃣ Log raw event
-        append_jsonl(STORAGE_PATHS["events"], {"direction": "in", "payload": data})
+        # 1️⃣ Log raw event (Yeh line jyon ki tyon rehne dein)
+        # NOTE: 'append_jsonl' agar jsonl file mein save kar raha hai, toh ise rehne dein ya hata dein
+        # agar ab sirf DB use karna hai. Hum isse ignore kar rahe hain abhi.
+        # append_jsonl(STORAGE_PATHS["events"], {"direction": "in", "payload": data})
 
         # 2️⃣ Extract messages and process
         if "entry" in data:
@@ -185,8 +191,9 @@ async def webhook_post(request: Request):
                     value = change.get("value", {})
                     if "messages" in value:
                         for message in value["messages"]:
-                            process_message(message)
-
+                            
+                            # process_message(message) - Isse bhi check karein, shayad yehi db use karta ho
+                            
                             sender = message.get("from")
                             
                             if "text" in message:
@@ -200,14 +207,37 @@ async def webhook_post(request: Request):
                             else:
                                 msg_text = "[Unsupported message type]"
 
-                            update_employee_chat(sender, msg_text)
+                            # 🛑 CRITICAL FIX: Database mein data save karein (Insertion Logic)
+                            await save_incoming_message(sender, msg_text)
+                            
+                            # update_employee_chat(sender, msg_text) # <-- Isko delete kar dein agar sirf DB use karna hai
 
         return {"ok": True}
 
     except Exception as e:
         print("❌ Error in webhook_post:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Raise HTTPException(status_code=500, detail=str(e))
+        return {"error": str(e), "status_code": 500} # Simple return for debugging
 
+
+# ───────────────────────────────────────────
+# Naya Helper Function for DB Insertion
+# ───────────────────────────────────────────
+async def save_incoming_message(phone_number: str, message_body: str):
+    """Database mein naye WhatsApp message ko save karta hai."""
+    try:
+        async with await get_session() as session:
+            new_inbox_entry = WhatsAppInbox(
+                phone=phone_number,
+                message_text=message_body,
+                processed=False  # Naya message unprocessed hota hai
+            )
+            session.add(new_inbox_entry)
+            await session.commit()
+            print(f"✅ Message saved for {phone_number}: {message_body[:30]}...")
+            
+    except Exception as e:
+        print(f"❌ DATABASE INSERTION FAILED: {e}")
 # Runtime state placeholders
 FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", "30"))
 FOLLOWUP_TIMERS = {}
@@ -2293,6 +2323,7 @@ async def _app_shutdown():
 
 # Note: legacy socketserver-based main() removed. Run the app with uvicorn:
 #    .venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
 

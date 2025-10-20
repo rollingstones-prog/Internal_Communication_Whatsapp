@@ -27,5 +27,6 @@ python-docx
 SQLAlchemy>=2.0.0
 psycopg2-binary  # <-- Isse aapka "No module named 'psycopg2'" issue hal ho jayega
 aiosqlite>=0.18.0 # <-- CRITICAL for SQLite fallback
-
+psycopg2-binary
 # NOTE: asyncpg ko hata diya gaya hai taaki dependencies clean rahein.
+

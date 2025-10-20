@@ -22,13 +22,10 @@ google-generativeai
 pdfminer.six
 reportlab
 python-docx
- 
+ 
 # Database
 SQLAlchemy>=2.0.0
-# NOTE: asyncpg is great for asyncio, but since you had the psycopg2 error, 
-# we rely on psycopg2-binary for the basic connection:
-psycopg2-binary # <-- Isse aapka "No module named 'psycopg2'" issue hal ho jayega
-aiosqlite>=0.18.0
+psycopg2-binary  # <-- Isse aapka "No module named 'psycopg2'" issue hal ho jayega
+aiosqlite>=0.18.0 # <-- CRITICAL for SQLite fallback
 
-# Agar aapko asyncpg alag se chahiye
-asyncpg>=0.27.0
+# NOTE: asyncpg ko hata diya gaya hai taaki dependencies clean rahein.

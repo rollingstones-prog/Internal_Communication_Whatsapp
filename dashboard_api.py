@@ -1,159 +1,276 @@
-"""
-Async SQLAlchemy PostgreSQL helper for the project
-— adds WhatsAppInbox model and message helpers.
-"""
-from __future__ import annotations
-import os, json
+import subprocess
+import tempfile
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from typing import Optional
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
-from sqlalchemy import Integer, String, Text, Boolean, DateTime, select, update
-from sqlalchemy.sql import func
+from datetime import datetime
+import json
+import os
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables (Local testing ke liye)
+# 🛑 CHANGES: PostgreSQL imports hata diye
+# import psycopg2 
+# from urllib.parse import urlparse
+# 🛑 CHANGES: db.py ke zaroori async functions import kiye
+from db import get_new_messages, get_session, Employee 
+
+
+# .env file load karein (Agar local development mein hain)
 load_dotenv(override=True)
 
-# 🛑 FIX: DATABASE_URL ko Environment Variable se load karein.
-# Agar DATABASE_URL set nahi hai (jaisa ki hum Render mein isko delete karne wale hain), toh yeh SQLite use karega.
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db")
+# -------------------
+# Init FastAPI & CORS
+# -------------------
+app = FastAPI() # <--- Yahi 'app' object uvicorn dhundhta hai
 
-Base = declarative_base()
-engine: Optional[AsyncEngine] = None
-SessionLocal: Optional[sessionmaker] = None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# -------------------
+# DB & File Setup
+# -------------------
+# Zaroori Environment Variables
+# DB_URL ko hata diya gaya hai.
+EMPLOYEES_FILE = Path("./employees.json")
+REPORTS_DIR = Path("./reports")
+UPLOAD_DIR = Path("./uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+REPORTS_DIR.mkdir(exist_ok=True)
 
-# ───────────────────────────────────────────
-# MODELS (Wahi rahega)
-# ───────────────────────────────────────────
-class Employee(Base):
-    __tablename__ = "employees"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
-    msisdn: Mapped[str] = mapped_column(String(32), nullable=False)
-    pref: Mapped[str] = mapped_column(String(16),
-                                     nullable=False,
-                                     server_default="auto")
-    meta: Mapped[Optional[str]] = mapped_column(Text)
-    created_at: Mapped[Optional[DateTime]] = mapped_column(
-        DateTime(timezone=True), server_default=func.now())
-
-
-class Task(Base):
-    __tablename__ = "tasks"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    employee_id: Mapped[int] = mapped_column(Integer, nullable=True)
-    title: Mapped[Optional[str]] = mapped_column(String(256))
-    details: Mapped[Optional[str]] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(32),
-                                     nullable=False,
-                                     server_default="pending")
-    created_at: Mapped[Optional[DateTime]] = mapped_column(
-        DateTime(timezone=True), server_default=func.now())
+# ElevenLabs Setup (Wahi rakha gaya hai)
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 
-class WhatsAppInbox(Base):
-    __tablename__ = "whatsapp_inbox"
-    id: Mapped[int] = mapped_column(Integer,
-                                     primary_key=True,
-                                     autoincrement=True)
-    phone: Mapped[str] = mapped_column(String(32), nullable=False)
-    message_text: Mapped[str] = mapped_column(Text, nullable=False)
-    processed: Mapped[bool] = mapped_column(Boolean,
-                                            nullable=False,
-                                            server_default="false")
-    created_at: Mapped[Optional[DateTime]] = mapped_column(
-        DateTime(timezone=True), server_default=func.now())
+# -------------------
+# Database Functions (Ab sirf db.py ke async functions use honge)
+# -------------------
 
+# 🛑 get_db_connection function delete kar diya gaya hai.
 
-# ───────────────────────────────────────────
-# CONNECTION + HELPERS (Wahi rahega, sirf SessionLocal fix)
-# ───────────────────────────────────────────
-async def get_engine() -> AsyncEngine:
-    global engine
-    if engine is None:
-        # Ab yeh line sahi DATABASE_URL (Postgres) ya SQLite URL use karegi
-        engine = create_async_engine(DATABASE_URL, echo=False, future=True)
-    return engine
-
-
-async def get_session() -> AsyncSession:
-    global SessionLocal
-    if SessionLocal is None:
-        eng = await get_engine()
-        SessionLocal = sessionmaker(bind=eng,
-                                     class_=AsyncSession,
-                                     expire_on_commit=False)
-    return SessionLocal()
-
-
-async def init_db(migrate_employees_from: Path
-                  | None = Path("./employees.json")) -> None:
-    """Create tables and optionally migrate employees.json."""
-    eng = await get_engine()
+async def read_db_events():
+    """db.py se WhatsAppInbox ke messages load karta hai aur unhe 'event' format mein badalta hai."""
     try:
-        async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        # Humne WhatsAppInbox se data load karne ka faisla kiya hai.
+        inbox_messages = await get_new_messages() 
+        
+        events = []
+        for msg in inbox_messages:
+            # WhatsAppInbox data ko dashboard ke expected event format (WA_RECV) mein badlein
+            events.append({
+                "kind": "WA_RECV",
+                "employee": find_employee_name_by_msisdn(msg['phone']),
+                "msisdn": msg['phone'],
+                "at": msg['at'].isoformat() + "Z" if msg.get('at') else datetime.utcnow().isoformat() + "Z", 
+                "payload": {
+                    "type": "text",
+                    "text": {"body": msg['message_text']}
+                }
+            })
+        
+        # Data ko chronological order (shuru se aakhir tak) mein rakhein.
+        return sorted(events, key=lambda x: x.get('at', ""))
+        
     except Exception as e:
-        # Fallback to SQLite if Postgres unavailable
-        print(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
-        sqlite_url = "sqlite+aiosqlite:///./what_agent.db"
-        global engine
-        engine = create_async_engine(sqlite_url, echo=False, future=True)
-        global SessionLocal
-        SessionLocal = sessionmaker(bind=engine,
-                                     class_=AsyncSession,
-                                     expire_on_commit=False)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        print(f"❌ Database Read Error using db.py: {e}")
+        return []
 
-    # Optional migration of employees.json
+
+# -------------------
+# Helper Functions (Employee data local file se)
+# -------------------
+
+def load_employees():
+    """Load employees.json and return as dict."""
+    if not EMPLOYEES_FILE.exists():
+        return {}
+    with open(EMPLOYEES_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def find_employee_name_by_msisdn(msisdn: str):
+    employees = load_employees()
+    for name, info in employees.items():
+        if isinstance(info, dict) and info.get("msisdn") == msisdn:
+            return name
+        elif info == msisdn: # Fallback for old employee.json structure
+            return name
+    return msisdn
+
+# -------------------
+# ElevenLabs API Functions (Wahi rakha gaya hai)
+# -------------------
+
+def tts_to_mp3(text, out_path, voice_id=ELEVENLABS_VOICE_ID):
+    url = ELEVENLABS_TTS_URL.format(voice_id=voice_id)
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}, "output_format": "mp3"}
     try:
-        data = json.load(open(migrate_employees_from)
-                             ) if migrate_employees_from.exists() else {}
-    except Exception:
-        data = {}
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code == 200:
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            return str(out_path)
+        print(f"TTS API Error: {resp.status_code}, {resp.text}")
+        return None
+    except Exception as e:
+        print("TTS error:", e)
+        return None
 
-    async with await get_session() as session:
-        res = await session.execute(select(func.count()).select_from(Employee))
-        count = res.scalar_one_or_none() or 0
-        if count == 0 and data:
-            for name, val in data.items():
-                msisdn = val["msisdn"] if isinstance(val, dict) else val
-                pref = val.get("pref", os.getenv("DELIVERY_DEFAULT",
-                                                     "auto")) if isinstance(
-                                                     val, dict) else "auto"
-                session.add(Employee(name=name, msisdn=msisdn, pref=pref))
-            await session.commit()
+def stt_from_audio(audio_path: Path):
+    headers = {"xi-api-key": ELEVENLABS_API_KEY}
+    try:
+        audio_path = Path(audio_path)
+        use_path = audio_path
+        if audio_path.suffix.lower() in [".ogg", ".opus", ".wav"]:
+            out_path = Path(tempfile.gettempdir()) / (audio_path.stem + ".mp3")
+            if not audio_path.is_file():
+                raise ValueError(f"Invalid audio file: {audio_path.name}")
+            cmd = ["ffmpeg", "-y", "-i", str(audio_path.resolve()), str(out_path.resolve())]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            use_path = out_path
+
+        with open(use_path, "rb") as f:
+            files = {"file": f}
+            data = {"model_id": "scribe_v1"}
+            resp = requests.post(ELEVENLABS_STT_URL, headers=headers, data=data, files=files, timeout=60)
+
+        if resp.status_code == 200:
+            result = resp.json()
+            return result.get("text", "").strip()
+        else:
+            print("❌ ElevenLabs STT error:", resp.status_code, resp.text)
+            return "Audio transcription me temporary issue hai."
+
+    except Exception as e:
+        print("❌ ElevenLabs STT exception:", str(e))
+        return "Audio transcription me temporary issue hai."
 
 
-async def get_new_messages():
-    """Return list of unprocessed WhatsApp messages."""
-    async with await get_session() as session:
-        # NOTE: Hum WhatsAppInbox table se data le rahe hain, isliye events table ki zaroorat nahi hai.
-        result = await session.execute(
-            select(WhatsAppInbox).where(WhatsAppInbox.processed == False))
-        rows = result.scalars().all()
-        return [{
-            "inbox_id": r.id,
-            "phone": r.phone,
-            "message_text": r.message_text,
-            "at": r.created_at # Timestamps ko use kiya
-        } for r in rows]
+# -------------------
+# API Endpoints (Ab async functions use honge)
+# -------------------
+
+@app.get("/chats/all")
+async def get_all_chats():
+    # Ab DB se events load honge
+    events = await read_db_events() 
+    employees = {}
+    
+    for e in events:
+        kind = e.get("kind")
+        if kind != "WA_RECV": # Hum abhi sirf WA_RECV (aaye hue messages) load kar rahe hain
+            continue
+
+        emp_name = e.get("employee")
+        msisdn = e.get("msisdn")
+        if not emp_name:
+            continue
+
+        payload = e.get("payload", {})
+        last_msg = payload.get("text", {}).get("body") or "📎 Media"
+        last_ts = e.get("at")
+        
+        # Hamesha latest message se update karein
+        employees[emp_name] = {
+            "name": emp_name,
+            "msisdn": msisdn,
+            "lastMessage": last_msg,
+            "lastTimestamp": last_ts,
+            "avatar": f"https://api.dicebear.com/7.x/identicon/svg?seed={emp_name}",
+            "online": True
+        }
+
+    return {"employees": list(employees.values())}
 
 
-async def mark_message_processed(inbox_id: int):
-    """Mark message as processed."""
-    async with await get_session() as session:
-        await session.execute(
-            update(WhatsAppInbox).where(WhatsAppInbox.id == inbox_id).values(
-                processed=True))
-        await session.commit()
+@app.get("/chats/{employee}")
+async def get_employee_chat(employee: str):
+    # Ab DB se events load honge
+    events = await read_db_events() 
+    chat = []
+    
+    for e in events:
+        kind = e.get("kind")
+        emp_name = (e.get("employee") or e.get("msisdn") or "").lower()
+        if emp_name != employee.lower() or kind != "WA_RECV":
+            continue
+
+        payload = e.get("payload", {})
+        
+        chat.append({
+            "sender": "Employee",
+            "type": payload.get("type", "text"),
+            "text": payload.get("text", {}).get("body"),
+            "filename": None, 
+            "timestamp": e.get("at")
+        })
+
+    # Sort by time
+    chat = sorted(chat, key=lambda x: x.get("timestamp") or "")
+
+    return {
+        "employee": employee,
+        "messages": chat
+    }
 
 
-async def close_engine():
-    global engine
-    if engine is not None:
-        await engine.dispose()
-        engine = None
+@app.post("/send")
+async def send_message(request: Request):
+    data = await request.json()
+    employee = data.get("employee")
+    message = data.get("message", {})
+    if not employee or not message:
+        return {"error": "employee and message are required"}
+    
+    # TODO: WhatsApp API call to send message & Database mein WA_SEND event save karein
+    print(f"DEBUG: Message sent to {employee} and should be logged to DB.")
+
+    return {"status": "ok", "message": "Message sent/logged (DB implementation needed)"}
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    safe_filename = Path(file.filename).name
+    file_path = UPLOAD_DIR / safe_filename
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    # TODO: Database mein UPLOAD event save karein
+    print(f"DEBUG: File uploaded: {safe_filename} and should be logged to DB.")
+
+    return {"status": "ok", "file": safe_filename, "path": str(file_path)}
+
+
+@app.get("/report/{employee}")
+def get_report(employee: str):
+    report_file = REPORTS_DIR / f"{employee}.txt"
+    if not report_file.exists():
+        return {"employee": employee, "report": "No report found"}
+    return {"employee": employee, "report": report_file.read_text(encoding="utf-8")}
+
+@app.post("/tts")
+async def text_to_speech(request: Request):
+    data = await request.json()
+    text = data.get("text")
+    if not text:
+        return {"error": "No text provided"}
+    out_path = UPLOAD_DIR / f"tts_{int(datetime.utcnow().timestamp())}.mp3"
+    file_path = tts_to_mp3(text, out_path)
+    return {"file": file_path}
+
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    safe_filename = Path(file.filename).name
+    audio_path = UPLOAD_DIR / safe_filename
+    with open(audio_path, "wb") as f:
+        f.write(await file.read())
+    text = stt_from_audio(audio_path)
+    return {"text": text}

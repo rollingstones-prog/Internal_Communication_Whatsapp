@@ -1,29 +1,109 @@
-from fastapi import FastAPI, Request, Response, HTTPException
 import os
 import json
 import time
 import warnings
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
 import re
 import io
 import threading
+import logging
+import requests
+import mimetypes
+
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 from PIL import Image
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-import logging
-import requests
-import mimetypes
-# Assuming this is main.py or webhook_handler.py
-# ... (Aapke existing imports) ...
-from db import get_session, WhatsAppInbox # <-- Yeh line add karein
-# Import local DB helper and ElevenLabs TTS/STT if available
+from threading import Lock
+from filelock import FileLock
+
+from ai_worker import get_reply_from_ai, analyze_image_with_gpt, whisper_transcribe_audio
+
+# Multi-agent system imports (Option B)
+try:
+    from services.task_queue import task_queue
+    from agents.orchestrator import orchestrator
+    from agents.task_agent import task_agent
+    from agents.analysis_agent import analysis_agent
+    from agents.conversation_agent import conversation_agent
+    from agents.reporting_agent import reporting_agent
+    MULTI_AGENT_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Multi-agent system not available: {e}")
+    MULTI_AGENT_AVAILABLE = False
+
+
+# ============================================================
+# 🧠 Multi-Agent Command Router
+# ============================================================
+def route_to_multi_agent(agent_type, payload):
+    """Dispatch task to a specific agent if multi-agent system is active."""
+    enable_multi_agent = os.getenv("ENABLE_MULTI_AGENT",
+                                   "false").lower() == "true"
+    if enable_multi_agent and MULTI_AGENT_AVAILABLE:
+        try:
+            import asyncio
+            asyncio.create_task(task_queue.enqueue_task(agent_type, payload))
+            print(f"🚀 Task routed to {agent_type} with payload: {payload}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Multi-agent routing failed: {e}")
+            return False
+    else:
+        print("ℹ️ Multi-agent disabled or not available.")
+        return False
+
+
+# -------------------------
+# 🔧 AUTO-HEAL: Sanitize events.jsonl at startup
+# -------------------------
+def sanitize_events_log():
+    """Clean up corrupted or malformed entries in events.jsonl"""
+    fixed_lines = []
+    if not os.path.exists("events.jsonl"):
+        print("📝 No events.jsonl found. Will be created on first event.")
+        return
+    try:
+        with open("events.jsonl", "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    # Ensure all required fields exist with defaults
+                    data["employee"] = data.get("employee") or "unknown"
+                    data["event"] = data.get("event") or ""
+                    data["kind"] = data.get("kind") or "UNKNOWN"
+                    data["at"] = data.get(
+                        "at") or datetime.utcnow().isoformat() + "Z"
+                    fixed_lines.append(data)
+                except Exception as parse_error:
+                    print(
+                        f"⚠️ Skipping corrupted line: {line[:50]}... Error: {parse_error}"
+                    )
+                    continue
+
+        # Rewrite the file with only valid entries
+        with open("events.jsonl", "w") as f:
+            for item in fixed_lines:
+                f.write(json.dumps(item) + "\n")
+
+        print(
+            f"✅ Events log sanitized. {len(fixed_lines)} valid entries kept.")
+    except Exception as e:
+        print(f"⚠️ Failed to sanitize events.jsonl: {e}")
+
+
+# -------------------------
+# 🧠 Optional local modules
+# -------------------------
 try:
     from db import init_db, close_engine
 except Exception:
-    # init_db placeholder will be defined later if import fails
     init_db = None
     close_engine = None
 
@@ -33,12 +113,15 @@ except Exception:
     tts_to_mp3 = None
     stt_from_mp3 = None
 
-# PDF text extractor: prefer pdfminer, fall back to PyPDF2 or noop
+# -------------------------
+# 📄 PDF Text Extractor
+# -------------------------
 try:
     from pdfminer.high_level import extract_text as extract_text
 except Exception:
     try:
         import PyPDF2
+
         def extract_text(path):
             try:
                 with open(path, "rb") as f:
@@ -48,39 +131,103 @@ except Exception:
             except Exception:
                 return ""
     except Exception:
+
         def extract_text(path):
             return ""
 
+
+# -------------------------
+# 🌍 Environment & FastAPI setup
+# -------------------------
 load_dotenv(override=True)
-app = FastAPI()
-# FastAPI app instance
 
+app = FastAPI(title="Internal Communication WhatsApp AI", version="1.0.0")
 
-# Environment
+# Allow CORS (needed for frontend + Render + Meta)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
+# 🧾 Environment Variables
+# -------------------------
 WA_TOKEN = os.getenv("WA_TOKEN")
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN") or "abc123"
 BOSS_WA_ID = os.getenv("BOSS_WA_ID")
 
-# Storage paths
+# -------------------------
+# 📁 Local Storage Paths
+# -------------------------
+BASE_DIR = Path(__file__).resolve().parent
 STORAGE_PATHS = {
-    "employees": Path("./employees.json"),
-    "tasks": Path("./tasks.jsonl"),
-    "events": Path("./events.jsonl"),
-    "seen_ids": Path("./seen_ids.json"),
-    "media": Path("./media"),
-    "reports": Path("./reports"),
-    "reports_out": Path("./reports_out"),
-    "voice_arm": Path("./voice_arm.json"),
+    "employees": BASE_DIR / "employees.json",
+    "tasks": BASE_DIR / "tasks.jsonl",
+    "events": BASE_DIR / "events.jsonl",
+    "seen_ids": BASE_DIR / "seen_ids.json",
+    "media": BASE_DIR / "media",
+    "reports": BASE_DIR / "reports",
+    "reports_out": BASE_DIR / "reports_out",
+    "voice_arm": BASE_DIR / "voice_arm.json",
 }
+
+# Ensure required folders exist
+for folder_key in ["media", "reports", "reports_out"]:
+    STORAGE_PATHS[folder_key].mkdir(exist_ok=True)
+
+
+# >>> FIX: Normalize numbers (boss & employees)
+def normalize_msisdn(msisdn: str) -> str:
+    """Ensure consistent WhatsApp number format (no + or spaces)."""
+    if not msisdn:
+        raise ValueError("Phone number cannot be empty")
+
+    if not isinstance(msisdn, str):
+        raise TypeError("Phone number must be a string")
+
+    normalized = msisdn.replace("+", "").replace(" ", "").strip()
+
+    # Basic validation for phone number format
+    if not normalized.isdigit():
+        raise ValueError(
+            "Phone number must contain only digits after normalization")
+
+    if not (8 <= len(normalized) <= 15):  # Standard phone number length
+        raise ValueError("Phone number length must be between 8 and 15 digits")
+
+    return normalized
+
+
+# -------------------------
+# 🚀 Health Check Route
+# -------------------------
+@app.get("/")
+async def home():
+    """Simple health-check endpoint."""
+    return {"status": "ok", "message": "Backend is live 🚀"}
+
+
+print("🔑 WA_TOKEN (first 20 chars):", WA_TOKEN[:20])
 
 # In-memory state
 SEEN_MESSAGE_IDS = set()
 EMP_PENDING = {}
 BOSS_PENDING = {}
+message_lock = Lock()
+timer_lock = Lock()
 FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", "30"))
 FOLLOWUP_TIMERS = {}
-CAPTURE_STATE = {"on": False, "name": None, "buffer": [], "multi": False, "targets": []}
+CAPTURE_STATE = {
+    "on": False,
+    "name": None,
+    "buffer": [],
+    "multi": False,
+    "targets": []
+}
 LAST_MEDIA = {"type": None}
 ROUTER = None
 GLOBAL_STYLE = ""
@@ -90,11 +237,14 @@ PDF_PROMPT = ""
 
 # If DB init wasn't imported, provide a minimal async stub so startup won't crash.
 if init_db is None:
+
     async def init_db():
         return True
 
+
 # If ElevenLabs functions aren't available, provide safe stubs.
 if tts_to_mp3 is None:
+
     def tts_to_mp3(text, out_path, voice_id=None):
         # noop fallback: write simple TTS-like placeholder file if path is provided
         try:
@@ -106,22 +256,32 @@ if tts_to_mp3 is None:
         except Exception:
             return None
 
+
 if stt_from_mp3 is None:
+
     def stt_from_mp3(audio_path):
         return ""
 
+
 # Lightweight fallback AI router to avoid AttributeError when ROUTER isn't configured.
 class _FallbackRouter:
+
     def analyze_image(self, prompt, img_bytes):
         return "Image analysis unavailable (no AI configured)."
+
     def summarize_pdf_text(self, prompt, text):
         t = text or ""
-        return (t[:800] + "...") if len(t) > 800 else (t or "No text to summarize.")
+        return (t[:800] +
+                "...") if len(t) > 800 else (t or "No text to summarize.")
+
     def summarize_text(self, prompt, text):
         t = text or ""
-        return (t[:800] + "...") if len(t) > 800 else (t or "No text to summarize.")
+        return (t[:800] +
+                "...") if len(t) > 800 else (t or "No text to summarize.")
+
     def analyze(self, prompt, text):
         return self.summarize_text(prompt, text)
+
 
 # Ensure ROUTER is set to a fallback if not provided by the runtime.
 if ROUTER is None:
@@ -139,7 +299,8 @@ def setup_storage():
             if p.suffix == ".jsonl":
                 p.write_text("", encoding="utf-8")
             else:
-                p.write_text("{}" if p.suffix == ".json" else "", encoding="utf-8")
+                p.write_text("{}" if p.suffix == ".json" else "",
+                             encoding="utf-8")
     try:
         if STORAGE_PATHS["seen_ids"].exists():
             with open(STORAGE_PATHS["seen_ids"], "r", encoding="utf-8") as f:
@@ -150,138 +311,159 @@ def setup_storage():
         print("Warning: failed to load seen_ids:", e)
 
 
+@app.head("/webhook")
+async def head_webhook():
+    # Meta sometimes sends HEAD before GET
+    return Response(status_code=200)
+
 
 @app.get("/webhook")
-async def webhook_get(request: Request):
+async def verify_webhook(request: Request):
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
+    print("🔍 VERIFY REQUEST:", dict(params))
+    print("SERVER TOKEN:", VERIFY_TOKEN)
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified successfully!")
-        return Response(content=challenge, media_type="text/plain", status_code=200)
+        print("✅ WEBHOOK VERIFIED SUCCESSFULLY!")
+        return Response(content=challenge,
+                        media_type="text/plain",
+                        status_code=200)
     else:
-        print("❌ Webhook verification failed.")
-        raise HTTPException(status_code=403, detail="Verification failed")@app.get("/webhook")
-async def webhook_get(request: Request):
-    # Return the challenge value for webhook verification
-    q = request.query_params
-    if ('hub.mode' in q and 'hub.verify_token' in q and q.get('hub.mode') == 'subscribe' and q.get('hub.verify_token') == VERIFY_TOKEN):
-        return Response(content=q.get('hub.challenge', ''), media_type="text/plain")
-    raise HTTPException(status_code=403)
+        print("❌ WEBHOOK VERIFICATION FAILED")
+        return Response(content="Verification failed", status_code=403)
 
-
-# Yahan 'main.py' ka updated webhook_post function diya gaya hai
 
 @app.post("/webhook")
 async def webhook_post(request: Request):
     try:
         data = await request.json()
+        print("📩 Incoming event:", data)
 
-        # 1️⃣ Log raw event (Yeh line jyon ki tyon rehne dein)
-        # NOTE: 'append_jsonl' agar jsonl file mein save kar raha hai, toh ise rehne dein ya hata dein
-        # agar ab sirf DB use karna hai. Hum isse ignore kar rahe hain abhi.
-        # append_jsonl(STORAGE_PATHS["events"], {"direction": "in", "payload": data})
+        entry = data.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return Response(status_code=200)
 
-        # 2️⃣ Extract messages and process
-        if "entry" in data:
-            for entry in data.get("entry", []):
-                for change in entry.get("changes", []):
-                    value = change.get("value", {})
-                    if "messages" in value:
-                        for message in value["messages"]:
-                            
-                            # process_message(message) - Isse bhi check karein, shayad yehi db use karta ho
-                            
-                            sender = message.get("from")
-                            
-                            if "text" in message:
-                                msg_text = message["text"]["body"]
-                            elif "button" in message:
-                                msg_text = f"[Button] {message['button'].get('text')}"
-                            elif "interactive" in message:
-                                msg_text = "[Interactive reply]"
-                            elif "audio" in message:
-                                msg_text = "[Audio message]"
-                            else:
-                                msg_text = "[Unsupported message type]"
+        message = messages[0]
+        msg_from = message["from"]
+        msg_type = message.get("type", "")
+        msg_text = ""
 
-                            # 🛑 CRITICAL FIX: Database mein data save karein (Insertion Logic)
-                            await save_incoming_message(sender, msg_text)
-                            
-                            # update_employee_chat(sender, msg_text) # <-- Isko delete kar dein agar sirf DB use karna hai
+        # --- Get Sender Name (from contact profile) ---
+        contact = value.get("contacts", [{}])[0]
+        staff_name = contact.get("profile", {}).get("name", "Staff Member")
 
-        return {"ok": True}
+        # --- TEXT MESSAGE HANDLING ---
+        # ✅ Step 3 Fix — centralize all message routing
+        # Instead of replying here, just forward the message
+        # to the main handler that decides (Boss / Employee / Unknown)
+        handle_incoming_whatsapp_message(message)
+
+        # Return success so WhatsApp knows we received the event
+        return Response(content="EVENT_RECEIVED",
+                        media_type="text/plain",
+                        status_code=200)
 
     except Exception as e:
         print("❌ Error in webhook_post:", e)
-        # Raise HTTPException(status_code=500, detail=str(e))
-        return {"error": str(e), "status_code": 500} # Simple return for debugging
-
-
-# ───────────────────────────────────────────
-# Naya Helper Function for DB Insertion
-# ───────────────────────────────────────────
-async def save_incoming_message(phone_number: str, message_body: str):
-    """Database mein naye WhatsApp message ko save karta hai."""
-    try:
-        async with await get_session() as session:
-            new_inbox_entry = WhatsAppInbox(
-                phone=phone_number,
-                message_text=message_body,
-                processed=False  # Naya message unprocessed hota hai
-            )
-            session.add(new_inbox_entry)
-            await session.commit()
-            print(f"✅ Message saved for {phone_number}: {message_body[:30]}...")
-            
-    except Exception as e:
-        print(f"❌ DATABASE INSERTION FAILED: {e}")
-# Runtime state placeholders
-FOLLOWUP_MINUTES = int(os.getenv("FOLLOWUP_MINUTES", "30"))
-FOLLOWUP_TIMERS = {}
-CAPTURE_STATE = {"on": False, "name": None, "buffer": [], "multi": False, "targets": []}
-LAST_MEDIA = {"type": None}
-ROUTER = None             # will hold your AI router / model object later
-GLOBAL_STYLE = ""         # optional prompt prefix
-VOICE_PROMPT = ""         # used by audio summarization
-IMG_PROMPT = ""           # used by analyze_image_with_ai()
-PDF_PROMPT = ""           # used by analyze_pdf_with_ai()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Startup behavior: ensure storage + DB initialized
 @app.on_event("startup")
 async def _app_startup():
     try:
+        # Auto-heal corrupted events.jsonl at startup
+        sanitize_events_log()
+
         setup_storage()
         # call imported init_db (may be a stub or the real DB initializer)
         await init_db()
+
+        # Initialize multi-agent system if enabled
+        enable_multi_agent = os.getenv("ENABLE_MULTI_AGENT",
+                                       "false").lower() == "true"
+
+        if enable_multi_agent and MULTI_AGENT_AVAILABLE:
+            print("🤖 Initializing RollingAgent Multi-Agent System...")
+
+            # Register agent handlers with task queue
+            task_queue.register_handler("task_agent", task_agent.execute_task)
+            task_queue.register_handler("analysis_agent",
+                                        analysis_agent.execute_task)
+            task_queue.register_handler("conversation_agent",
+                                        conversation_agent.execute_task)
+            task_queue.register_handler("reporting_agent",
+                                        reporting_agent.execute_task)
+            task_queue.register_handler("orchestrator",
+                                        orchestrator.execute_task)
+
+            # Start task queue workers
+            await task_queue.start()
+
+            print(
+                "🧬 Multi-Agent Layer Activated — Boss, Employees, and Clones Ready."
+            )
+            print(
+                "✅ RollingAgent v5 now running in Multi-Agent + Persistent Mode"
+            )
+            print("   • Gemini 2.0 Flash (primary) + GPT-4o mini (fallback)")
+            print("   • PostgreSQL + FAISS + JSONL memory active")
+            print(
+                f"   • {len(load_employees())} employees with restored context"
+            )
+        else:
+            print("✅ Legacy AI Worker Active - Single-agent mode")
+
     except Exception as e:
         print("Startup error:", e)
     print(f"Boss WhatsApp ID: {BOSS_WA_ID}")
-    print("New commands: setboss, map, pref, forward voice, report <Name> voice")
-    print("Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali")
-    print("Voice routing: @voice Hira,Ali (then send audio), transcribe <Name> yes/no")
-    print("Docs: docs, employees")
-    print("NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester.")
+    print(
+        "Commands: setboss, map, employees, clone <Name>, @tasks <Name>, @send, report <Name>"
+    )
+    print(
+        "Multi-recipient: assign Hira,Ali | message, ask Hira,Ali question, status Hira,Ali"
+    )
+    print(
+        "Voice: @voice Hira,Ali (then send audio), transcribe <Name> yes/no, forward voice"
+    )
+    print("Docs: docs, employees, pref <Name> text/voice")
+    print(
+        "NOTE: Dev mode me sirf test numbers ko messages jaate hain. WhatsApp App → Phone numbers → Add tester."
+    )
+
 
 def save_seen_message_id(msg_id):
     """Save a message ID to the seen set and persist to disk."""
-    global SEEN_MESSAGE_IDS
-    SEEN_MESSAGE_IDS.add(msg_id)
-    try:
-        with open(STORAGE_PATHS["seen_ids"], "w", encoding="utf-8") as f:
-            json.dump(list(SEEN_MESSAGE_IDS), f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error saving seen IDs: {e}")
+    if not msg_id:
+        return False
+
+    with message_lock:
+        global SEEN_MESSAGE_IDS
+        SEEN_MESSAGE_IDS.add(msg_id)
+        try:
+            with open(STORAGE_PATHS["seen_ids"], "w", encoding="utf-8") as f:
+                json.dump(list(SEEN_MESSAGE_IDS), f, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logging.error(f"Error saving seen IDs: {e}")
+            return False
+
 
 def is_message_seen(msg_id):
     """Check if a message ID has already been processed."""
     return msg_id in SEEN_MESSAGE_IDS
 
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
 
 def save_last_voice(name, file_path):
     employees = load_employees()
@@ -293,6 +475,7 @@ def save_last_voice(name, file_path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+
 def get_last_voice(name):
     employees = load_employees()
     emp_data = employees.get(name)
@@ -303,6 +486,7 @@ def get_last_voice(name):
         return None
     return json.load(open(path, "r", encoding="utf-8")).get("path")
 
+
 def get_voice_arm_state():
     """Get current voice arm state."""
     try:
@@ -310,6 +494,7 @@ def get_voice_arm_state():
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"armed": False, "targets": [], "ts": None}
+
 
 def set_voice_arm_state(armed, targets=None):
     """Set voice arm state."""
@@ -324,34 +509,37 @@ def set_voice_arm_state(armed, targets=None):
     except Exception as e:
         print(f"Error saving voice arm state: {e}")
 
+
 def parse_name_list(names_str: str) -> list:
     """Parse comma-separated names into a list."""
     if not names_str.strip():
         return []
-    
+
     # Split by comma, trim spaces, filter empty
     names = [name.strip() for name in names_str.split(",") if name.strip()]
-    
+
     # Title case normalization (but keep original for exact matching)
     normalized = []
     for name in names:
         if name:
             normalized.append(name)
-    
+
     return normalized
+
 
 def get_employee_by_name(name: str, employees: dict) -> tuple:
     """Get employee data by name (case-insensitive)."""
     # First try exact match
     if name in employees:
         return name, employees[name]
-    
+
     # Then try case-insensitive match
     for emp_name, emp_data in employees.items():
         if emp_name.lower() == name.lower():
             return emp_name, emp_data
-    
+
     return None, None
+
 
 def mask_msisdn(msisdn: str) -> str:
     """Mask MSISDN for display (e.g., 923001234567 -> 923***4567)."""
@@ -359,19 +547,34 @@ def mask_msisdn(msisdn: str) -> str:
         return msisdn[:3] + "***" + msisdn[-4:]
     return msisdn
 
+
 def append_jsonl(path, data):
+    """Append data to a JSONL file with proper locking and error handling."""
+    if not isinstance(data, dict):
+        raise ValueError("Data must be a dictionary")
+
     data["timestamp"] = now_iso()
+
+    # Using file locking to prevent concurrent writes
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        from filelock import FileLock
+        lock_path = str(path) + ".lock"
+
+        with FileLock(lock_path, timeout=10):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        return True
     except Exception as e:
-        print(f"Error writing to {path}: {e}")
+        logging.error(f"Error writing to {path}: {e}")
+        return False
+
 
 def read_jsonl(path):
     if not path.exists():
         return []
     with open(path, "r", encoding="utf-8") as f:
         return [json.loads(line) for line in f]
+
 
 def load_employees():
     try:
@@ -389,37 +592,47 @@ def load_employees():
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def deliver_to_employee(name: str, msg_text: str, override: str = None) -> dict:
+
+def deliver_to_employee(name: str,
+                        msg_text: str,
+                        override: str = None) -> dict:
     # Load employee data
     emps = load_employees()
     e = emps.get(name)
-    
+
     # Check if the employee exists in the system
     if not e:
         return {"ok": False, "err": f"{name} not in employees.json"}
-    
+
     # Get employee's MSISDN and preferred mode
     msisdn = e["msisdn"]
-    mode = (override or e.get("pref") or os.getenv("DELIVERY_DEFAULT","auto")).lower()
+    mode = (override or e.get("pref")
+            or os.getenv("DELIVERY_DEFAULT", "auto")).lower()
 
     # Voice Mode - Send TTS audio
     if mode == "voice":
         outp = STORAGE_PATHS["media"] / f"tts_{name}_{int(time.time())}.mp3"
-        ok = tts_to_file(msg_text, outp)  # Use existing TTS function (text-to-speech)
-        
+        ok = tts_to_file(msg_text,
+                         outp)  # Use existing TTS function (text-to-speech)
+
         if ok:
             # Try sending the audio to the employee
             result = wa_send_audio(msisdn, outp, mark_as_voice=True)
             if result["ok"]:
-                return {"ok": True, "mode": "voice"}  # Successful audio delivery
+                return {
+                    "ok": True,
+                    "mode": "voice"
+                }  # Successful audio delivery
             else:
                 # Fallback to text if voice sending fails
                 whatsapp_send_text(msisdn, msg_text)
                 # Notify boss about the fallback
                 if BOSS_WA_ID:
-                    whatsapp_send_text(BOSS_WA_ID, f"Voice delivery fail {name}. Text bhej diya.")
+                    whatsapp_send_text(
+                        BOSS_WA_ID,
+                        f"Voice delivery fail {name}. Text bhej diya.")
                 return {"ok": True, "mode": "text_fallback"}
-        
+
         # TTS failed, fallback to text
         whatsapp_send_text(msisdn, msg_text)
         return {"ok": True, "mode": "text_fallback"}
@@ -434,6 +647,7 @@ def deliver_to_employee(name: str, msg_text: str, override: str = None) -> dict:
     whatsapp_send_text(msisdn, msg_text)
     return {"ok": True, "mode": "text_auto"}
 
+
 def update_boss_number(new_boss_id):
     """Update the boss WhatsApp ID at runtime."""
     global BOSS_WA_ID
@@ -441,17 +655,30 @@ def update_boss_number(new_boss_id):
     # Also update environment variable for this session
     os.environ["BOSS_WA_ID"] = new_boss_id
 
+
 def save_task_record(name, title, due_text):
-    task_data = {"name": name, "title": title, "due": due_text, "status": "pending"}
+    task_data = {
+        "name": name,
+        "title": title,
+        "due": due_text,
+        "status": "pending"
+    }
     append_jsonl(STORAGE_PATHS["tasks"], task_data)
-    append_jsonl(STORAGE_PATHS["events"], {"kind": "TASK_SAVE", "name": name, "title": title, "due": due_text})
+    append_jsonl(STORAGE_PATHS["events"], {
+        "kind": "TASK_SAVE",
+        "name": name,
+        "title": title,
+        "due": due_text
+    })
+
 
 def mark_done_in_tasks(name, title, notes, minutes):
     tasks = read_jsonl(STORAGE_PATHS["tasks"])
     task_found = False
     updated_tasks = []
     for task in tasks:
-        if task.get("name") == name and task.get("title") == title and task.get("status") == "pending":
+        if task.get("name") == name and task.get(
+                "title") == title and task.get("status") == "pending":
             task["status"] = "completed"
             task["notes"] = notes
             task["minutes"] = minutes
@@ -462,14 +689,26 @@ def mark_done_in_tasks(name, title, notes, minutes):
     if not task_found:
         # Create a new task if not found (or if already completed)
         new_task = {
-            "name": name, "title": title, "status": "completed",
-            "notes": notes, "minutes": minutes, "completed_at": now_iso()
+            "name": name,
+            "title": title,
+            "status": "completed",
+            "notes": notes,
+            "minutes": minutes,
+            "completed_at": now_iso()
         }
         updated_tasks.append(new_task)
-        append_jsonl(STORAGE_PATHS["events"], {"kind": "TASK_COMPLETED_NEW", "name": name, "title": title})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "kind": "TASK_COMPLETED_NEW",
+            "name": name,
+            "title": title
+        })
     else:
-        append_jsonl(STORAGE_PATHS["events"], {"kind": "TASK_COMPLETED_UPDATE", "name": name, "title": title})
-    
+        append_jsonl(STORAGE_PATHS["events"], {
+            "kind": "TASK_COMPLETED_UPDATE",
+            "name": name,
+            "title": title
+        })
+
     # Rewrite the tasks.jsonl file
     # This is a simple approach. For very large files, a more efficient update might be needed.
     with open(STORAGE_PATHS["tasks"], "w", encoding="utf-8") as f:
@@ -477,7 +716,6 @@ def mark_done_in_tasks(name, title, notes, minutes):
             # Remove timestamp added by append_jsonl for consistency before rewriting
             task.pop("timestamp", None)
             f.write(json.dumps(task, ensure_ascii=False) + "\n")
-
 
 
 def read_report(name, tail_chars=10000):
@@ -492,6 +730,7 @@ def read_report(name, tail_chars=10000):
     msgs = [m for m in data["messages"]]
     return json.dumps(msgs[-50:], ensure_ascii=False, indent=2)  # last 50 msgs
 
+
 VOICE_ANALYSIS_PROMPT = """
 Transcript ko dekho aur short bullets me likho ke banda kya keh raha hai.
 Sirf uske content ka analysis karo (kya bola, kya demand thi, kya issue tha).
@@ -499,8 +738,6 @@ Reply ya acknowledgement mat likho.
 Roman Urdu me 3–5 simple lines likho.
 """
 
-
-from datetime import datetime, timedelta, timezone
 
 def normalize_ts(ts_string: str):
     """
@@ -536,7 +773,6 @@ def normalize_ts(ts_string: str):
     return ts
 
 
-
 def get_full_report_messages(name):
     """
     Employee ki last 12 ghante ki report ke messages wapas karega,
@@ -555,39 +791,45 @@ def get_full_report_messages(name):
 
     cutoff = datetime.now().replace(tzinfo=None) - timedelta(hours=12)
     msgs = [
-        m for m in data.get("messages", [])
-        if normalize_ts(m.get("ts"))
-        and normalize_ts(m["ts"]) >= cutoff
-        and m.get("from") != "Boss"
+        m for m in data.get("messages", []) if normalize_ts(m.get("ts"))
+        and normalize_ts(m["ts"]) >= cutoff and m.get("from") != "Boss"
     ]
     return msgs
 
+
 #  WhatsApp Helper Functions ---
-def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
+def whatsapp_send_text(to_msisdn: str, text: str, emp_name: str = None):
+    """Send a plain text message via WhatsApp Business API."""
+
     token = os.getenv("WA_TOKEN") or ""
     phone_id = os.getenv("WA_PHONE_ID") or ""
     url = f"https://graph.facebook.com/v23.0/{phone_id}/messages"
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to_msisdn,
         "type": "text",
-        "text": {"body": text}
+        "text": {
+            "body": text
+        }
     }
     headers = {"Authorization": f"Bearer {token}"}
-    # debug mask
+
+    # --- Debug Mask ---
     if token:
         print("WA_TOKEN(use):", token[:8] + "..." + token[-6:])
     else:
         print("WA_TOKEN(use): NONE")
 
     try:
+        # --- Send message ---
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         try:
             data = resp.json()
         except Exception:
             data = {"status_code": resp.status_code, "text": resp.text}
 
-        
+        # --- Identify employee name (if not given) ---
         employees = load_employees()
         if not emp_name:
             for name, info in employees.items():
@@ -595,28 +837,33 @@ def whatsapp_send_text(to_msisdn: str, text: str , emp_name: str = None):
                     emp_name = name
                     break
 
+        # --- Log record for history/tracking ---
         record = {
-            "at": now_iso(),
-            "kind": "WA_SEND" ,
+            "at": datetime.utcnow().isoformat(),
+            "kind": "WA_SEND",
             "employee": emp_name,
             "msisdn": to_msisdn,
             "to": to_msisdn,
-            "payload": {"text": {"body": text}, "type": "text"}
+            "payload": {
+                "text": {
+                    "body": text
+                },
+                "type": "text"
+            }
         }
         append_jsonl(STORAGE_PATHS["events"], record)
 
+        # --- Error handling for failed sends ---
         if resp.status_code >= 400:
-            handle_whatsapp_error(data, to_msisdn)  # ALWAYS dict-like
+            handle_whatsapp_error(data, to_msisdn)
+
+        # ✅ Always return the full response
         return data
 
-    except requests.RequestException as e:
-        # network-level error
-        data = {"error": {"message": str(e), "code": -1}}
-        append_jsonl(STORAGE_PATHS["events"], {
-            "at": now_iso(), "kind": "WA_SEND_ERR", "to": to_msisdn, "err": str(e)
-        })
-        # yahan koi user-msg dubara mat bhejna
-        return data
+    except Exception as e:
+        print(f"❌ whatsapp_send_text error: {e}")
+        return {"ok": False, "error": str(e)}
+
 
 def handle_whatsapp_error(error_info, to_msisdn: str):
     # error_info kabhi dict, kabhi raw string ho sakta hai — normalize:
@@ -628,13 +875,17 @@ def handle_whatsapp_error(error_info, to_msisdn: str):
 
     err = error_info.get("error", {}) or {}
     code = err.get("code")
-    sub  = err.get("error_subcode")
-    msg  = err.get("message") or "Unknown error"
+    sub = err.get("error_subcode")
+    msg = err.get("message") or "Unknown error"
 
-    append_jsonl(STORAGE_PATHS["events"], {
-        "at": now_iso(), "kind": "WA_ERR",
-        "code": code, "subcode": sub, "message": msg
-    })
+    append_jsonl(
+        STORAGE_PATHS["events"], {
+            "at": now_iso(),
+            "kind": "WA_ERR",
+            "code": code,
+            "subcode": sub,
+            "message": msg
+        })
 
     # SPECIFIC HANDLING:
     if code == 190:
@@ -655,6 +906,7 @@ def handle_whatsapp_error(error_info, to_msisdn: str):
     # default
     print(f"WA ERROR: {code} / {sub} → {msg}")
 
+
 def wa_get_media_url(media_id):
     """Get media metadata url from WhatsApp Graph API (prefer newer v23 endpoint)."""
     url = f"https://graph.facebook.com/v23.0/{media_id}"
@@ -671,7 +923,8 @@ def run_grouped_analysis_for_report(name, to_msisdn=None):
     to_msisdn = to_msisdn or BOSS_WA_ID
     msgs = get_full_report_messages(name)
     if not msgs:
-        whatsapp_send_text(to_msisdn, f"{name} ki report me analyze karne ko kuch nahi mila.")
+        whatsapp_send_text(
+            to_msisdn, f"{name} ki report me analyze karne ko kuch nahi mila.")
         return
 
     buckets = {"text": [], "image": [], "document": [], "audio": []}
@@ -717,9 +970,13 @@ def run_grouped_analysis_for_report(name, to_msisdn=None):
     if findings:
         combined = f"📊 {name} Report Analysis:\n\n" + "\n\n".join(findings)
         for i in range(0, len(combined), 3500):
-            whatsapp_send_text(to_msisdn, combined[i:i+3500])
+            whatsapp_send_text(to_msisdn, combined[i:i + 3500])
     else:
-        whatsapp_send_text(to_msisdn, f"{name} ki report me analysis ke liye kuch useful nahi tha. Analysis krne ke liye kuch nahi mila. Warne meh Kradeta")
+        whatsapp_send_text(
+            to_msisdn,
+            f"{name} ki report me analysis ke liye kuch useful nahi tha. Analysis krne ke liye kuch nahi mila. Warne meh Kradeta"
+        )
+
 
 def employee_send_combined_analysis(emp_name, to_msisdn):
     """
@@ -763,14 +1020,16 @@ def employee_send_combined_analysis(emp_name, to_msisdn):
 
     # SEND COMBINED
     if findings:
-        combined = f"📝 Boss Message Analysis ({emp_name}):\n\n" + "\n\n".join(findings)
+        combined = f"📝 Boss Message Analysis ({emp_name}):\n\n" + "\n\n".join(
+            findings)
         for i in range(0, len(combined), 3500):  # chunking for WA limit
-            whatsapp_send_text(to_msisdn, combined[i:i+3500])
+            whatsapp_send_text(to_msisdn, combined[i:i + 3500])
     else:
         whatsapp_send_text(to_msisdn, "Analyze karne ko kuch nahi mila.")
 
     # reset state
     EMP_PENDING.pop(emp_name, None)
+
 
 def wa_download_media(media_id: str, out_path: Path) -> Path | None:
     """
@@ -800,20 +1059,26 @@ def wa_download_media(media_id: str, out_path: Path) -> Path | None:
         print(f"[WA] Error downloading media (ID: {media_id}): {e}")
         return None
 
+
 def wa_upload_audio(file_path: Path) -> str | None:
     """Upload audio file to WhatsApp Cloud API and return media ID."""
     url = f"https://graph.facebook.com/v23.0/{WA_PHONE_ID}/media"
     headers = {"Authorization": f"Bearer {WA_TOKEN}"}
-    
+
     try:
         with open(file_path, 'rb') as audio_file:
             files = {
-                'file': (file_path.name, audio_file, detect_audio_mime(file_path))
+                'file':
+                (file_path.name, audio_file, detect_audio_mime(file_path))
             }
             data = {"messaging_product": "whatsapp"}
-            
-            response = requests.post(url, headers=headers, files=files, data=data, timeout=30)
-            
+
+            response = requests.post(url,
+                                     headers=headers,
+                                     files=files,
+                                     data=data,
+                                     timeout=30)
+
             if response.status_code >= 400:
                 # Log error details
                 error_data = {
@@ -828,16 +1093,18 @@ def wa_upload_audio(file_path: Path) -> str | None:
                 except:
                     pass
                 append_jsonl(STORAGE_PATHS["events"], error_data)
-                
-                print(f"Audio upload failed: {response.status_code} - {response.text}")
+
+                print(
+                    f"Audio upload failed: {response.status_code} - {response.text}"
+                )
                 return None
-            
+
             result = response.json()
             return result.get("id")
-            
+
     except Exception as e:
         error_data = {
-            "kind": "WA_MEDIA_ERR", 
+            "kind": "WA_MEDIA_ERR",
             "file": str(file_path),
             "error": str(e),
             "timestamp": now_iso()
@@ -846,11 +1113,6 @@ def wa_upload_audio(file_path: Path) -> str | None:
         print(f"Audio upload exception: {e}")
         return None
 
-import requests
-
-import mimetypes
-import requests
-from pathlib import Path
 
 def wa_upload_media(file_path: Path) -> dict:
     """
@@ -885,7 +1147,11 @@ def wa_upload_media(file_path: Path) -> dict:
             files = {"file": (file_path.name, f, mime_type)}
             data = {"messaging_product": "whatsapp"}
 
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=30)
+            resp = requests.post(url,
+                                 headers=headers,
+                                 files=files,
+                                 data=data,
+                                 timeout=30)
             resp.raise_for_status()
 
             result = resp.json()
@@ -899,13 +1165,17 @@ def wa_upload_media(file_path: Path) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Unexpected error: {e}"}
 
+
 def wa_send_document(to_msisdn, media_id=None, filename=None, link=None):
     """
     Send a document via WhatsApp API
     Either pass media_id (uploaded) OR link (public URL).
     """
     url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {WA_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
     payload = {
         "messaging_product": "whatsapp",
@@ -936,7 +1206,10 @@ def wa_send_document(to_msisdn, media_id=None, filename=None, link=None):
         return {"ok": False, "error": result}
 
 
-def wa_send_audio(to_msisdn: str, media_id: str | None = None, link: str | None = None, mark_as_voice: bool = False) -> dict:
+def wa_send_audio(to_msisdn: str,
+                  media_id: str | None = None,
+                  link: str | None = None,
+                  mark_as_voice: bool = False) -> dict:
     """
     Send an audio file via WhatsApp Cloud API.
     - Either pass media_id (uploaded with wa_upload_media) OR link (public URL).
@@ -981,13 +1254,17 @@ def wa_send_audio(to_msisdn: str, media_id: str | None = None, link: str | None 
     except Exception as e:
         return {"ok": False, "error": f"Unexpected error: {e}"}
 
+
 def wa_send_image(to_msisdn, media_id=None, caption=None, link=None):
     """
     Send an image via WhatsApp API.
     Either pass media_id (uploaded with wa_upload_media) OR link (public URL).
     """
     url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {WA_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
     payload = {
         "messaging_product": "whatsapp",
@@ -1017,6 +1294,7 @@ def wa_send_image(to_msisdn, media_id=None, caption=None, link=None):
     else:
         return {"ok": False, "error": result}
 
+
 # --- OpenAI Helper Functions ---
 def analyze_image_with_ai(image_path):
     try:
@@ -1027,12 +1305,17 @@ def analyze_image_with_ai(image_path):
             buf = io.BytesIO()
             img.save(buf, "JPEG", quality=92)
             img_bytes = buf.getvalue()
-            raw = ROUTER.analyze_image(f"{GLOBAL_STYLE}\n{IMG_PROMPT}", img_bytes)
+            raw = ROUTER.analyze_image(f"{GLOBAL_STYLE}\n{IMG_PROMPT}",
+                                       img_bytes)
             lines = [ln.strip() for ln in raw.splitlines() if ln.strip()][:10]
             return "\n".join(lines) if lines else "No clear findings."
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "AI_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "AI_ERR",
+            "details": str(e)
+        })
         return "Image analysis me temporary issue hai."
+
 
 def analyze_pdf_with_ai(pdf_path):
     try:
@@ -1041,15 +1324,20 @@ def analyze_pdf_with_ai(pdf_path):
             return "PDF se text nahi mila."
         return ROUTER.summarize_pdf_text(f"{GLOBAL_STYLE}\n{PDF_PROMPT}", text)
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "AI_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "AI_ERR",
+            "details": str(e)
+        })
         return "PDF analysis me temporary issue hai."
 
+
 # --- Document/Text Helpers for analysis ---
+
 
 def extract_text_from_docx_file(path: Path) -> str:
     try:
         import zipfile
-        import xml.etree.ElementTree as ET
+        import defusedxml.ElementTree as ET
         with zipfile.ZipFile(path) as z:
             with z.open("word/document.xml") as f:
                 xml = f.read()
@@ -1061,6 +1349,7 @@ def extract_text_from_docx_file(path: Path) -> str:
         return " ".join(texts)
     except Exception:
         return ""
+
 
 def summarize_text_content(text: str) -> str:
     """
@@ -1091,7 +1380,10 @@ def analyze_document_file(file_path: Path) -> str:
             return summarize_text_content(raw)
         return "Is document se text extract nahi ho saka."
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "DOC_ANALYSIS_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "DOC_ANALYSIS_ERR",
+            "details": str(e)
+        })
         return "Document analysis me issue aaya."
 
 
@@ -1100,34 +1392,128 @@ def transcribe_audio(audio_path):
         transcript = stt_from_mp3(audio_path)
         return transcript
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "AI_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "AI_ERR",
+            "details": str(e)
+        })
         return "Audio transcription me temporary issue hai."
+
 
 def detect_audio_mime(file_path: Path) -> str:
     """Detect MIME type for audio files based on extension."""
     ext = file_path.suffix.lower()
     mime_map = {
         ".mp3": "audio/mpeg",
-        ".ogg": "audio/ogg", 
+        ".ogg": "audio/ogg",
         ".opus": "audio/ogg",
         ".m4a": "audio/mp4",
         ".mp4": "audio/mp4",
         ".aac": "audio/aac"
     }
-    return mime_map.get(ext, "audio/mpeg")  # Default to MP3 for generated files
+    return mime_map.get(ext,
+                        "audio/mpeg")  # Default to MP3 for generated files
 
 
 def tts_to_file(text, out_path):
     try:
         result = tts_to_mp3(text, out_path)
-        if result and out_path.exists() and out_path.stat().st_size < 16 * 1024 * 1024:
+        if result and out_path.exists() and out_path.stat(
+        ).st_size < 16 * 1024 * 1024:
             return out_path
         else:
             print(f"Warning: TTS file too large or not created: {out_path}")
             return None
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "AI_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "AI_ERR",
+            "details": str(e)
+        })
         return None
+
+
+def send_reply_with_tts_decision(to_msisdn: str,
+                                 reply_text: str,
+                                 employee_name: str = None):
+    """
+    Send reply to employee with TTS decision logic.
+    Uses voice if:
+    - Reply > 100 words OR
+    - Employee preference is 'voice'
+    Otherwise sends text.
+    On TTS error, falls back to text and logs TTS_FAIL.
+    """
+    try:
+        employees = load_employees()
+        employee_pref = "text"
+
+        # Get employee preference
+        if employee_name:
+            for name, data in employees.items():
+                if name.lower() == employee_name.lower():
+                    employee_pref = data.get("pref", "text").lower()
+                    break
+
+        # Count words in reply
+        word_count = len(reply_text.split())
+
+        # Decide: voice or text
+        use_voice = (word_count > 100) or (employee_pref == "voice")
+
+        if use_voice and tts_to_mp3:
+            # Generate TTS audio
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            audio_path = STORAGE_PATHS[
+                "reports_out"] / f"reply_{employee_name}_{timestamp}.mp3"
+
+            try:
+                tts_result = tts_to_file(reply_text, audio_path)
+
+                if tts_result:
+                    # Upload and send as voice note
+                    upload_result = wa_upload_media(audio_path)
+                    if upload_result.get("ok"):
+                        media_id = upload_result.get("media_id")
+                        send_result = wa_send_audio(to_msisdn,
+                                                    media_id=media_id,
+                                                    mark_as_voice=True)
+
+                        if send_result.get("ok"):
+                            print(
+                                f"✅ Sent voice reply to {employee_name} ({word_count} words)"
+                            )
+                            return
+
+                # TTS succeeded but upload/send failed - fallback to text
+                print(
+                    f"⚠️ TTS generated but send failed, falling back to text")
+                append_jsonl(
+                    STORAGE_PATHS["events"], {
+                        "kind": "TTS_FAIL",
+                        "employee": employee_name,
+                        "reason": "Upload or send failed",
+                        "at": datetime.utcnow().isoformat()
+                    })
+
+            except Exception as e:
+                print(f"⚠️ TTS error: {e}")
+                append_jsonl(
+                    STORAGE_PATHS["events"], {
+                        "kind": "TTS_FAIL",
+                        "employee": employee_name,
+                        "error": str(e),
+                        "at": datetime.utcnow().isoformat()
+                    })
+
+        # Send as text (default or fallback)
+        whatsapp_send_text(to_msisdn, reply_text, emp_name=employee_name)
+        print(f"✅ Sent text reply to {employee_name} ({word_count} words)")
+
+    except Exception as e:
+        print(f"❌ Error in send_reply_with_tts_decision: {e}")
+        # Fallback: send text
+        whatsapp_send_text(to_msisdn, reply_text, emp_name=employee_name)
+
+
 def write_report(name, header, content, sender="Boss"):
     """
     Save chat/messages per-thread (WhatsApp style).
@@ -1183,11 +1569,13 @@ def write_report(name, header, content, sender="Boss"):
     except Exception as e:
         print(f"Error writing chat report for {name}: {e}")
 
+
 # --- Core Logic & Command Handling ---
 def polish_to_employee(name, body):
     lines = [f"- {line.strip()}" for line in body.splitlines() if line.strip()]
     formatted_body = "\n".join(lines)
     return f" {name},\nNeeche assignment hai:\n{formatted_body}\n\nProgress par yahin update bhej dein.\n— RollingStones Limited"
+
 
 def build_ai_summary_text(name):
     try:
@@ -1195,10 +1583,15 @@ def build_ai_summary_text(name):
         if not report_content.strip():
             return f"'{name}' ki report abhi tak submit nahi hui."
         user = "Is report ko 3–4 lines me concise executive summary Roman-Urdu me do. Kaam ki baat, direct."
-        return ROUTER.summarize_text(VOICE_ANALYSIS_PROMPT, user + "\n\n" + report_content)
+        return ROUTER.summarize_text(VOICE_ANALYSIS_PROMPT,
+                                     user + "\n\n" + report_content)
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "AI_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "AI_ERR",
+            "details": str(e)
+        })
         return "Report summary banane me temporary issue hai."
+
 
 def read_full_day_report(name):
     employees = load_employees()
@@ -1220,7 +1613,6 @@ def read_full_day_report(name):
             if ts_val and ts_val >= cutoff and m.get("from") != "Boss":
                 msgs.append(m)
 
-
         if not msgs:
             return f"{name} ki last 12 ghante ki koi report nahi bani."
 
@@ -1233,30 +1625,45 @@ def read_full_day_report(name):
                 if m.get("local_path") and Path(m["local_path"]).exists():
                     media = wa_upload_media(m["local_path"])
                     if media.get("ok"):
-                        wa_send_document(BOSS_WA_ID, media_id=media["media_id"], filename=m.get("filename"))
+                        wa_send_document(BOSS_WA_ID,
+                                         media_id=media["media_id"],
+                                         filename=m.get("filename"))
                     else:
-                        whatsapp_send_text(BOSS_WA_ID, f"{name}: {m.get('filename','')} (upload fail)")
+                        whatsapp_send_text(
+                            BOSS_WA_ID,
+                            f"{name}: {m.get('filename','')} (upload fail)")
                 elif m.get("media_id"):
-                    wa_send_document(BOSS_WA_ID, media_id=m["media_id"], filename=m.get("filename"))
+                    wa_send_document(BOSS_WA_ID,
+                                     media_id=m["media_id"],
+                                     filename=m.get("filename"))
                 else:
-                    whatsapp_send_text(BOSS_WA_ID, f"{name}: {m.get('filename','')} (no file found)")
+                    whatsapp_send_text(
+                        BOSS_WA_ID,
+                        f"{name}: {m.get('filename','')} (no file found)")
             elif t == "image":
-                wa_send_image(BOSS_WA_ID, media_id=m.get("media_id"), caption=f"{name} ki image")
+                wa_send_image(BOSS_WA_ID,
+                              media_id=m.get("media_id"),
+                              caption=f"{name} ki image")
             elif t == "audio":
                 if m.get("media_id"):
-                    wa_send_audio(BOSS_WA_ID, media_id=m["media_id"], mark_as_voice=True)
+                    wa_send_audio(BOSS_WA_ID,
+                                  media_id=m["media_id"],
+                                  mark_as_voice=True)
                 else:
-                    whatsapp_send_text(BOSS_WA_ID, f"{name}: Audio file missing")
+                    whatsapp_send_text(BOSS_WA_ID,
+                                       f"{name}: Audio file missing")
 
         # 2) ask-once analysis (AFTER sending everything)
         BOSS_PENDING.update({
             "active": True,
-            "awaiting_format": False,   # full analysis me format na poochna
+            "awaiting_format": False,  # full analysis me format na poochna
             "employee": name,
-            "kind": "full",             # pura report analyze karna hai
+            "kind": "full",  # pura report analyze karna hai
             "ts": int(time.time())
         })
-        whatsapp_send_text(BOSS_WA_ID, f"Boss, {name} ki poori report ka analysis chahiye? (yes/no)")
+        whatsapp_send_text(
+            BOSS_WA_ID,
+            f"Boss, {name} ki poori report ka analysis chahiye? (yes/no)")
 
         return f"{name} ki report bhej di gayi (last 12 ghante)."
 
@@ -1271,7 +1678,9 @@ def make_report_pdf(name, summary_text, image_notes, pdf_notes, out_path):
     story = []
 
     story.append(Paragraph(f"<b>Report — {name}</b>", styles['h1']))
-    story.append(Paragraph(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>", styles['h3']))
+    story.append(
+        Paragraph(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>",
+                  styles['h3']))
     story.append(Spacer(1, 0.2 * inch))
 
     story.append(Paragraph("<b>Executive Summary:</b>", styles['h2']))
@@ -1296,8 +1705,12 @@ def make_report_pdf(name, summary_text, image_notes, pdf_notes, out_path):
         doc.build(story)
         return out_path
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "PDF_GEN_ERR", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "PDF_GEN_ERR",
+            "details": str(e)
+        })
         return None
+
 
 def make_report_pdf_all(summary_per_employee, out_path):
     doc = SimpleDocTemplate(str(out_path))
@@ -1305,219 +1718,289 @@ def make_report_pdf_all(summary_per_employee, out_path):
     story = []
 
     story.append(Paragraph("<b>Combined Employee Report</b>", styles['h1']))
-    story.append(Paragraph(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>", styles['h3']))
+    story.append(
+        Paragraph(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>",
+                  styles['h3']))
     story.append(Spacer(1, 0.2 * inch))
 
     for name, summary in summary_per_employee.items():
         story.append(Paragraph(f"<b>Report for {name}:</b>", styles['h2']))
         story.append(Paragraph(summary, styles['Normal']))
         story.append(Spacer(1, 0.1 * inch))
-    
+
     story.append(Paragraph("— RollingStones Bot", styles['Normal']))
 
     try:
         doc.build(story)
         return out_path
     except Exception as e:
-        append_jsonl(STORAGE_PATHS["events"], {"error": "PDF_GEN_ERR_ALL", "details": str(e)})
+        append_jsonl(STORAGE_PATHS["events"], {
+            "error": "PDF_GEN_ERR_ALL",
+            "details": str(e)
+        })
         return None
-
 
 
 def send_pdf_to_boss(file_path, label_name):
     p = Path(file_path) if not isinstance(file_path, Path) else file_path
     if (not p) or (not p.exists()):
-        whatsapp_send_text(BOSS_WA_ID, f"Boss, {label_name} report file nahi mili.")
+        whatsapp_send_text(BOSS_WA_ID,
+                           f"Boss, {label_name} report file nahi mili.")
         return False
 
     upload = wa_upload_media(p)  # {"ok": bool, "media_id": "..."} expected
     if upload and upload.get("ok") and upload.get("media_id"):
-        result = wa_send_document(BOSS_WA_ID, media_id=upload["media_id"], filename=p.name)
+        result = wa_send_document(BOSS_WA_ID,
+                                  media_id=upload["media_id"],
+                                  filename=p.name)
         if result.get("ok"):
-            whatsapp_send_text(BOSS_WA_ID, f"{label_name} report bhej di gayi hai.")
+            whatsapp_send_text(BOSS_WA_ID,
+                               f"{label_name} report bhej di gayi hai.")
             return True
         else:
-            whatsapp_send_text(BOSS_WA_ID, f"{label_name} report send karte waqt koi error aa gaya.")
+            whatsapp_send_text(
+                BOSS_WA_ID,
+                f"{label_name} report send karte waqt koi error aa gaya.")
             return False
     else:
-        whatsapp_send_text(BOSS_WA_ID, f"{label_name} report upload nahi ho saki.")
+        whatsapp_send_text(BOSS_WA_ID,
+                           f"{label_name} report upload nahi ho saki.")
         return False
+
 
 def send_audio_to_boss(file_path, label_name):
     p = Path(file_path) if not isinstance(file_path, Path) else file_path
     if (not p) or (not p.exists()):
-        whatsapp_send_text(BOSS_WA_ID, f"Boss, {label_name} audio file nahi mili.")
+        whatsapp_send_text(BOSS_WA_ID,
+                           f"Boss, {label_name} audio file nahi mili.")
         return False
 
     upload = wa_upload_media(p)
     if upload and upload.get("ok") and upload.get("media_id"):
-        result = wa_send_audio(BOSS_WA_ID, media_id=upload["media_id"], mark_as_voice=True)
+        result = wa_send_audio(BOSS_WA_ID,
+                               media_id=upload["media_id"],
+                               mark_as_voice=True)
         if result.get("ok"):
-            whatsapp_send_text(BOSS_WA_ID, f"{label_name} audio file bhej di gayi hai.")
+            whatsapp_send_text(BOSS_WA_ID,
+                               f"{label_name} audio file bhej di gayi hai.")
             return True
         else:
-            whatsapp_send_text(BOSS_WA_ID, f"{label_name} audio file send karte waqt koi error aa gaya.")
+            whatsapp_send_text(
+                BOSS_WA_ID,
+                f"{label_name} audio file send karte waqt koi error aa gaya.")
             return False
     else:
-        whatsapp_send_text(BOSS_WA_ID, f"{label_name} audio file upload nahi ho sakti.")
+        whatsapp_send_text(BOSS_WA_ID,
+                           f"{label_name} audio file upload nahi ho sakti.")
         return False
 
 
 def schedule_followup(name, msisdn):
     cancel_followup(name)
+
     def send_followup():
-        whatsapp_send_text(msisdn, f"Salam {name}, apne kaam ka short update bhej dein. Shukriya.")
+        whatsapp_send_text(
+            msisdn,
+            f"Salam {name}, apne kaam ka short update bhej dein. Shukriya.")
         del FOLLOWUP_TIMERS[name]
-    
+
     timer = threading.Timer(FOLLOWUP_MINUTES * 60, send_followup)
     FOLLOWUP_TIMERS[name] = timer
     timer.start()
+
 
 def cancel_followup(name):
     if name in FOLLOWUP_TIMERS:
         FOLLOWUP_TIMERS[name].cancel()
         del FOLLOWUP_TIMERS[name]
 
+
 def handle_boss_command(text, from_msisdn):
     global CAPTURE_STATE, BOSS_PENDING
-    
+
     # Log boss intent for debugging
-    append_jsonl(STORAGE_PATHS["events"], {
-        "kind": "BOSS_INTENT", 
-        "text": text, 
-        "from": from_msisdn,
-        "timestamp": now_iso()
-    })
-    
+    append_jsonl(
+        STORAGE_PATHS["events"], {
+            "kind": "BOSS_INTENT",
+            "text": text,
+            "from": from_msisdn,
+            "timestamp": now_iso()
+        })
+
     # Pending-analysis conversation handling
     try:
         t = (text or "").strip().lower()
         if BOSS_PENDING.get("active"):
             # First stage: run analysis?
-                    if not BOSS_PENDING.get("awaiting_format"):
-                        if t in {"yes", "y", "haan", "han", "ji", "ok", "analyze", "analysis"}:
-                            kind = BOSS_PENDING.get("kind")
-                            emp = BOSS_PENDING.get("employee")
+            if not BOSS_PENDING.get("awaiting_format"):
+                if t in {
+                        "yes", "y", "haan", "han", "ji", "ok", "analyze",
+                        "analysis"
+                }:
+                    kind = BOSS_PENDING.get("kind")
+                    emp = BOSS_PENDING.get("employee")
 
-                            # ✅ NEW: full-report case
-                            if kind == "full" and emp:
-                                run_grouped_analysis_for_report(emp, to_msisdn=from_msisdn)
-                                # reset state
-                                BOSS_PENDING = {
-                                    "active": False, "awaiting_format": False, "kind": None,
-                                    "employee": None, "path": None, "filename": None,
-                                    "text": None, "transcript": None, "summary": None, "ts": 0
-                                }
-                                return
-
-                            # 🔽 OLD single-file analysis logic
-                            pth = BOSS_PENDING.get("path")
-                            summary = None
-                            transcript = None
-                            if kind == "image" and pth and Path(pth).exists():
-                                summary = analyze_image_with_ai(Path(pth))
-                            elif kind == "pdf" and pth and Path(pth).exists():
-                                summary = analyze_pdf_with_ai(Path(pth))
-                            elif kind == "document" and pth and Path(pth).exists():
-                                summary = analyze_document_file(Path(pth))
-                            elif kind == "audio" and pth and Path(pth).exists():
-                                transcript = transcribe_audio(Path(pth))
-                                try:
-                                    summary = ROUTER.summarize_text(f"{GLOBAL_STYLE}\n{VOICE_PROMPT}", transcript)
-                                except Exception:
-                                    summary = transcript
-                            elif kind == "text":
-                                summary = summarize_text_content(BOSS_PENDING.get("text") or "")
-                            else:
-                                summary = "Analysis path missing."
-
-                            BOSS_PENDING["summary"] = summary
-                            BOSS_PENDING["transcript"] = transcript
-                            BOSS_PENDING["awaiting_format"] = True
-
-                            # Ask for delivery preference
-                            if kind == "audio":
-                                whatsapp_send_text(
-                                    from_msisdn,
-                                    "Boss, analysis tayyar hai. Kya main Original Voice, Transcript, ya Summary (Text/PDF/Voice) me deliver karoon?"
-                                )
-                            else:
-                                whatsapp_send_text(
-                                    from_msisdn,
-                                    "Boss, analysis tayyar hai. Delivery format? Text, PDF ya Voice? Aap 'all' bhi keh sakte hain."
-                                )
-                            return
-
-                        elif t in {"no", "n", "skip", "nah", "na"}:
-                            BOSS_PENDING = {
-                                "active": False, "awaiting_format": False, "kind": None,
-                                "employee": None, "path": None, "filename": None,
-                                "text": None, "transcript": None, "summary": None, "ts": 0
-                            }
-                            return
-                    else:
-                        # awaiting format selection
-                        kind = BOSS_PENDING.get("kind")
-                        pth = BOSS_PENDING.get("path")
-                        summary = BOSS_PENDING.get("summary") or ""
-                        transcript = BOSS_PENDING.get("transcript")
-
-                        selected_all = any(w in t for w in ["all", "both"])
-                        wants_text = selected_all or ("text" in t)
-                        wants_pdf = selected_all or ("pdf" in t)
-                        wants_voice = selected_all or ("voice" in t)
-
-                        # Special voice options
-                        if kind == "audio" and ("original" in t or "orig" in t):
-                            if pth and Path(pth).exists():
-                                wa_send_audio(from_msisdn, Path(pth), mark_as_voice=True)
-                            BOSS_PENDING = {
-                                "active": False, "awaiting_format": False, "kind": None,
-                                "employee": None, "path": None, "filename": None,
-                                "text": None, "transcript": None, "summary": None, "ts": 0
-                            }
-                            return
-
-                        if kind == "audio" and "transcript" in t:
-                            if transcript:
-                                for i in range(0, len(transcript), 3500):
-                                    whatsapp_send_text(from_msisdn, transcript[i:i+3500])
-                            else:
-                                whatsapp_send_text(from_msisdn, "Transcript available nahi hai.")
-                            BOSS_PENDING = {
-                                "active": False, "awaiting_format": False, "kind": None,
-                                "employee": None, "path": None, "filename": None,
-                                "text": None, "transcript": None, "summary": None, "ts": 0
-                            }
-                            return
-
-                        delivered = False
-                        # Text
-                        if wants_text and summary:
-                            for i in range(0, len(summary), 3500):
-                                whatsapp_send_text(from_msisdn, summary[i:i+3500])
-                            delivered = True
-
-                        # PDF
-                        if wants_pdf and summary:
-                            out_path = STORAGE_PATHS["reports_out"] / f"{BOSS_PENDING.get('employee','Report')}_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-                            if make_report_pdf(BOSS_PENDING.get("employee","Report"), summary, [], [], out_path):
-                                send_pdf_to_boss(out_path, BOSS_PENDING.get("employee","Report"))
-                                delivered = True
-                            else:
-                                whatsapp_send_text(from_msisdn, "PDF banane me issue aaya.")
-
-                        # Voice (TTS of summary)
-                        if wants_voice and summary:
-                            tts_path = STORAGE_PATHS["reports_out"] / f"{BOSS_PENDING.get('employee','Report')}_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.mp3"
-                            if tts_to_file(summary, tts_path):
-                                wa_send_audio(from_msisdn, tts_path, mark_as_voice=True)
-                                delivered = True
-                            else:
-                                whatsapp_send_text(from_msisdn, "Voice summary ban nahi saki.")
-                                    
-
+                    # ✅ NEW: full-report case
+                    if kind == "full" and emp:
+                        run_grouped_analysis_for_report(emp,
+                                                        to_msisdn=from_msisdn)
+                        # reset state
+                        BOSS_PENDING = {
+                            "active": False,
+                            "awaiting_format": False,
+                            "kind": None,
+                            "employee": None,
+                            "path": None,
+                            "filename": None,
+                            "text": None,
+                            "transcript": None,
+                            "summary": None,
+                            "ts": 0
+                        }
                         return
+
+                    # 🔽 OLD single-file analysis logic
+                    pth = BOSS_PENDING.get("path")
+                    summary = None
+                    transcript = None
+                    if kind == "image" and pth and Path(pth).exists():
+                        summary = analyze_image_with_ai(Path(pth))
+                    elif kind == "pdf" and pth and Path(pth).exists():
+                        summary = analyze_pdf_with_ai(Path(pth))
+                    elif kind == "document" and pth and Path(pth).exists():
+                        summary = analyze_document_file(Path(pth))
+                    elif kind == "audio" and pth and Path(pth).exists():
+                        transcript = transcribe_audio(Path(pth))
+                        try:
+                            summary = ROUTER.summarize_text(
+                                f"{GLOBAL_STYLE}\n{VOICE_PROMPT}", transcript)
+                        except Exception:
+                            summary = transcript
+                    elif kind == "text":
+                        summary = summarize_text_content(
+                            BOSS_PENDING.get("text") or "")
+                    else:
+                        summary = "Analysis path missing."
+
+                    BOSS_PENDING["summary"] = summary
+                    BOSS_PENDING["transcript"] = transcript
+                    BOSS_PENDING["awaiting_format"] = True
+
+                    # Ask for delivery preference
+                    if kind == "audio":
+                        whatsapp_send_text(
+                            from_msisdn,
+                            "Boss, analysis tayyar hai. Kya main Original Voice, Transcript, ya Summary (Text/PDF/Voice) me deliver karoon?"
+                        )
+                    else:
+                        whatsapp_send_text(
+                            from_msisdn,
+                            "Boss, analysis tayyar hai. Delivery format? Text, PDF ya Voice? Aap 'all' bhi keh sakte hain."
+                        )
+                    return
+
+                elif t in {"no", "n", "skip", "nah", "na"}:
+                    BOSS_PENDING = {
+                        "active": False,
+                        "awaiting_format": False,
+                        "kind": None,
+                        "employee": None,
+                        "path": None,
+                        "filename": None,
+                        "text": None,
+                        "transcript": None,
+                        "summary": None,
+                        "ts": 0
+                    }
+                    return
+            else:
+                # awaiting format selection
+                kind = BOSS_PENDING.get("kind")
+                pth = BOSS_PENDING.get("path")
+                summary = BOSS_PENDING.get("summary") or ""
+                transcript = BOSS_PENDING.get("transcript")
+
+                selected_all = any(w in t for w in ["all", "both"])
+                wants_text = selected_all or ("text" in t)
+                wants_pdf = selected_all or ("pdf" in t)
+                wants_voice = selected_all or ("voice" in t)
+
+                # Special voice options
+                if kind == "audio" and ("original" in t or "orig" in t):
+                    if pth and Path(pth).exists():
+                        wa_send_audio(from_msisdn,
+                                      Path(pth),
+                                      mark_as_voice=True)
+                    BOSS_PENDING = {
+                        "active": False,
+                        "awaiting_format": False,
+                        "kind": None,
+                        "employee": None,
+                        "path": None,
+                        "filename": None,
+                        "text": None,
+                        "transcript": None,
+                        "summary": None,
+                        "ts": 0
+                    }
+                    return
+
+                if kind == "audio" and "transcript" in t:
+                    if transcript:
+                        for i in range(0, len(transcript), 3500):
+                            whatsapp_send_text(from_msisdn,
+                                               transcript[i:i + 3500])
+                    else:
+                        whatsapp_send_text(from_msisdn,
+                                           "Transcript available nahi hai.")
+                    BOSS_PENDING = {
+                        "active": False,
+                        "awaiting_format": False,
+                        "kind": None,
+                        "employee": None,
+                        "path": None,
+                        "filename": None,
+                        "text": None,
+                        "transcript": None,
+                        "summary": None,
+                        "ts": 0
+                    }
+                    return
+
+                delivered = False
+                # Text
+                if wants_text and summary:
+                    for i in range(0, len(summary), 3500):
+                        whatsapp_send_text(from_msisdn, summary[i:i + 3500])
+                    delivered = True
+
+                # PDF
+                if wants_pdf and summary:
+                    out_path = STORAGE_PATHS[
+                        "reports_out"] / f"{BOSS_PENDING.get('employee','Report')}_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+                    if make_report_pdf(BOSS_PENDING.get("employee", "Report"),
+                                       summary, [], [], out_path):
+                        send_pdf_to_boss(
+                            out_path, BOSS_PENDING.get("employee", "Report"))
+                        delivered = True
+                    else:
+                        whatsapp_send_text(from_msisdn,
+                                           "PDF banane me issue aaya.")
+
+                # Voice (TTS of summary)
+                if wants_voice and summary:
+                    tts_path = STORAGE_PATHS[
+                        "reports_out"] / f"{BOSS_PENDING.get('employee','Report')}_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.mp3"
+                    if tts_to_file(summary, tts_path):
+                        wa_send_audio(from_msisdn,
+                                      tts_path,
+                                      mark_as_voice=True)
+                        delivered = True
+                    else:
+                        whatsapp_send_text(from_msisdn,
+                                           "Voice summary ban nahi saki.")
+
+                return
     except Exception as e:
         print(f"Error in boss command handling: {e}")
         return
@@ -1529,58 +2012,67 @@ def handle_boss_command(text, from_msisdn):
         employees = load_employees()
         if name in employees:
             CAPTURE_STATE = {"on": True, "name": name, "buffer": []}
-            whatsapp_send_text(from_msisdn, f"Task capture for {name} shuru. Lines bhejein. '@send' se forward karein.")
+            whatsapp_send_text(
+                from_msisdn,
+                f"Task capture for {name} shuru. Lines bhejein. '@send' se forward karein."
+            )
         else:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
         return
 
     # A2. Multi-recipient @tasks
     if re.match(r'^@tasks\s+([^|:]+)$', text, re.IGNORECASE):
         match = re.match(r'^@tasks\s+([^|:]+)$', text, re.IGNORECASE)
         names_str = match.group(1).strip()
-        
+
         names = parse_name_list(names_str)
         employees = load_employees()
         valid_names = []
         invalid_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
                 valid_names.append(emp_name)
             else:
                 invalid_names.append(name)
-        
-      
+
         return
 
     # A3. @voice command
-        # A3. @voice command
+    # A3. @voice command
     if re.match(r'^@voice\s+([^|:]+)$', text, re.IGNORECASE):
         match = re.match(r'^@voice\s+([^|:]+)$', text, re.IGNORECASE)
         names_str = match.group(1).strip()
-        
+
         names = parse_name_list(names_str)
         employees = load_employees()
         valid_names = []
         invalid_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
                 valid_names.append(emp_name)
             else:
                 invalid_names.append(name)
-        
+
         if not valid_names:
-            whatsapp_send_text(from_msisdn, f"Koi valid names nahi mile. Use: map <Name> 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"Koi valid names nahi mile. Use: map <Name> 923XXXXXXXXX")
             return
 
         # Arm state ON
         set_voice_arm_state(True, valid_names)
-        whatsapp_send_text(from_msisdn, f"Voice routing ON: {', '.join(valid_names)}.")
+        whatsapp_send_text(from_msisdn,
+                           f"Voice routing ON: {', '.join(valid_names)}.")
         if invalid_names:
-            whatsapp_send_text(from_msisdn, f"Skip: {', '.join(invalid_names)} (map nahi mile).")
+            whatsapp_send_text(
+                from_msisdn,
+                f"Skip: {', '.join(invalid_names)} (map nahi mile).")
 
         # NOTE: Actual audio forwarding hoga jab boss next baar voice note bheje.
         # Us waqt hum use upload karke employees ko bhejenge.
@@ -1589,77 +2081,87 @@ def handle_boss_command(text, from_msisdn):
     if CAPTURE_STATE["on"] and re.match(r'^@send$', text, re.IGNORECASE):
         name = CAPTURE_STATE["name"]
         employees = load_employees()
-        
+
         # Check if this is a multi-recipient task
         if CAPTURE_STATE.get("multi") and CAPTURE_STATE.get("targets"):
             targets = CAPTURE_STATE["targets"]
             body = "\n".join(CAPTURE_STATE["buffer"])
-            
+
             sent_names = []
             skip_names = []
-            
+
             for target_name in targets:
                 if target_name in employees:
                     polished_message = polish_to_employee(target_name, body)
-                    delivery_result = deliver_to_employee(target_name, polished_message)
+                    delivery_result = deliver_to_employee(
+                        target_name, polished_message)
                     if delivery_result["ok"]:
-                        write_report(target_name, "BOSS -> EMPLOYEE (multi-tasks)", body)
-                        schedule_followup(target_name, employees[target_name]["msisdn"])
+                        write_report(target_name,
+                                     "BOSS -> EMPLOYEE (multi-tasks)", body)
+                        schedule_followup(target_name,
+                                          employees[target_name]["msisdn"])
                         sent_names.append(target_name)
                     else:
                         skip_names.append(f"{target_name} (send fail)")
                 else:
                     skip_names.append(f"{target_name} (map nahi mila)")
-            
+
             # Send confirmation
-            
-                
-            
+
             if skip_names:
-                whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
+                whatsapp_send_text(from_msisdn,
+                                   f"Skip: {', '.join(skip_names)}.")
         else:
             # Single recipient (existing logic)
             if name in employees:
                 body = "\n".join(CAPTURE_STATE["buffer"])
                 polished_message = polish_to_employee(name, body)
                 delivery_result = deliver_to_employee(name, polished_message)
-                
+
                 if delivery_result["ok"]:
-                    write_report(name, "BOSS -> EMPLOYEE (forwarded instruction)", body)
+                    write_report(name,
+                                 "BOSS -> EMPLOYEE (forwarded instruction)",
+                                 body)
                     schedule_followup(name, employees[name]["msisdn"])
-                    
+
                 else:
-                    whatsapp_send_text(from_msisdn, f"Send fail {name}. Token/session ya mapping check karein.")
-          
-        
+                    whatsapp_send_text(
+                        from_msisdn,
+                        f"Send fail {name}. Token/session ya mapping check karein."
+                    )
+
         CAPTURE_STATE = {"on": False, "name": None, "buffer": []}
         return
 
     # A4. Transcribe command
     if re.match(r'^transcribe\s+(\w+)\s+(yes|no)$', text, re.IGNORECASE):
-        match = re.match(r'^transcribe\s+(\w+)\s+(yes|no)$', text, re.IGNORECASE)
+        match = re.match(r'^transcribe\s+(\w+)\s+(yes|no)$', text,
+                         re.IGNORECASE)
         name = match.group(1).capitalize()
         should_transcribe = match.group(2).lower() == "yes"
-        
+
         if should_transcribe:
             last_voice_path = get_last_voice(name)
             if last_voice_path and Path(last_voice_path).exists():
                 transcript = transcribe_audio(Path(last_voice_path))
-                write_report(name, "VOICE -> TRANSCRIPT (boss approved)", transcript)
+                write_report(name, "VOICE -> TRANSCRIPT (boss approved)",
+                             transcript)
                 whatsapp_send_text(from_msisdn, "Transcript save ho gayi.")
-           
-      
+
         return
 
     if CAPTURE_STATE["on"]:
         CAPTURE_STATE["buffer"].append(text)
         total_lines = len(CAPTURE_STATE["buffer"])
-        whatsapp_send_text(from_msisdn, f"Line add ho gayi (total {total_lines}). '@send' bhejein.")
+        whatsapp_send_text(
+            from_msisdn,
+            f"Line add ho gayi (total {total_lines}). '@send' bhejein.")
         return
 
     # B. Quick Assign (single-shot)
     if re.match(r'^assign\s+(\w+)\s*[|:]\s*(.+)$', text, re.IGNORECASE):
-        match = re.match(r'^assign\s+(\w+)\s*[|:]\s*(.+)$', text, re.IGNORECASE)
+        match = re.match(r'^assign\s+(\w+)\s*[|:]\s*(.+)$', text,
+                         re.IGNORECASE)
         name = match.group(1).capitalize()
         message = match.group(2).strip()
         employees = load_employees()
@@ -1669,18 +2171,22 @@ def handle_boss_command(text, from_msisdn):
             if delivery_result["ok"]:
                 write_report(name, "BOSS -> EMPLOYEE (quick assign)", message)
                 schedule_followup(name, employees[name]["msisdn"])
-                
+
             else:
-                whatsapp_send_text(from_msisdn, f"Send fail {name}. Token/session ya mapping check karein.")
-      
+                whatsapp_send_text(
+                    from_msisdn,
+                    f"Send fail {name}. Token/session ya mapping check karein."
+                )
+
         return
 
     # B2. Multi-recipient Assign
     if re.match(r'^assign\s+([^|:]+)\s*[|:]\s*(.+)$', text, re.IGNORECASE):
-        match = re.match(r'^assign\s+([^|:]+)\s*[|:]\s*(.+)$', text, re.IGNORECASE)
+        match = re.match(r'^assign\s+([^|:]+)\s*[|:]\s*(.+)$', text,
+                         re.IGNORECASE)
         names_str = match.group(1).strip()
         message = match.group(2).strip()
-        
+
         names = parse_name_list(names_str)
         if len(names) == 1:
             # Single name, handle as before
@@ -1690,38 +2196,43 @@ def handle_boss_command(text, from_msisdn):
                 polished_message = polish_to_employee(name, message)
                 delivery_result = deliver_to_employee(name, polished_message)
                 if delivery_result["ok"]:
-                    write_report(name, "BOSS -> EMPLOYEE (quick assign)", message)
+                    write_report(name, "BOSS -> EMPLOYEE (quick assign)",
+                                 message)
                     schedule_followup(name, employees[name]["msisdn"])
-                
+
                 else:
-                    whatsapp_send_text(from_msisdn, f"Send fail {name}. Token/session ya mapping check karein.")
-        
+                    whatsapp_send_text(
+                        from_msisdn,
+                        f"Send fail {name}. Token/session ya mapping check karein."
+                    )
+
             return
-        
+
         # Multi-recipient
         employees = load_employees()
         sent_names = []
         skip_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
                 polished_message = polish_to_employee(emp_name, message)
-                delivery_result = deliver_to_employee(emp_name, polished_message)
+                delivery_result = deliver_to_employee(emp_name,
+                                                      polished_message)
                 if delivery_result["ok"]:
-                    write_report(emp_name, "BOSS -> EMPLOYEE (multi-assign)", message)
+                    write_report(emp_name, "BOSS -> EMPLOYEE (multi-assign)",
+                                 message)
                     schedule_followup(emp_name, emp_data["msisdn"])
                     sent_names.append(emp_name)
                 else:
                     skip_names.append(f"{name} (send fail)")
             else:
                 skip_names.append(f"{name} (map nahi mila)")
-        
+
         # Send confirmation
         if sent_names:
             followup_msg = f"Follow-up {FOLLOWUP_MINUTES} min baad (jahan set ho)."
-           
-        
+
         if skip_names:
             whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
         return
@@ -1731,12 +2242,12 @@ def handle_boss_command(text, from_msisdn):
         match = re.match(r'^ask\s+([^|:]+)\s+(.+)$', text, re.IGNORECASE)
         names_str = match.group(1).strip()
         question = match.group(2).strip()
-        
+
         names = parse_name_list(names_str)
         employees = load_employees()
         sent_names = []
         skip_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
@@ -1749,12 +2260,11 @@ def handle_boss_command(text, from_msisdn):
                     skip_names.append(f"{name} (send fail)")
             else:
                 skip_names.append(f"{name} (map nahi mila)")
-        
+
         # Send confirmation
         if sent_names:
             followup_msg = f"Follow-up {FOLLOWUP_MINUTES} min baad (jahan set ho)."
-            
-        
+
         if skip_names:
             whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
         return
@@ -1763,12 +2273,12 @@ def handle_boss_command(text, from_msisdn):
     if re.match(r'^status\s+([^|:]+)$', text, re.IGNORECASE):
         match = re.match(r'^status\s+([^|:]+)$', text, re.IGNORECASE)
         names_str = match.group(1).strip()
-        
+
         names = parse_name_list(names_str)
         employees = load_employees()
         sent_names = []
         skip_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
@@ -1781,12 +2291,11 @@ def handle_boss_command(text, from_msisdn):
                     skip_names.append(f"{name} (send fail)")
             else:
                 skip_names.append(f"{name} (map nahi mila)")
-        
+
         # Send confirmation
         if sent_names:
             followup_msg = f"Follow-up {FOLLOWUP_MINUTES} min baad (jahan set ho)."
-            
-        
+
         if skip_names:
             whatsapp_send_text(from_msisdn, f"Skip: {', '.join(skip_names)}.")
         return
@@ -1795,12 +2304,12 @@ def handle_boss_command(text, from_msisdn):
     if re.match(r'^followup\s+([^|:]+)$', text, re.IGNORECASE):
         match = re.match(r'^followup\s+([^|:]+)$', text, re.IGNORECASE)
         names_str = match.group(1).strip()
-        
+
         names = parse_name_list(names_str)
         employees = load_employees()
         sent_names = []
         skip_names = []
-        
+
         for name in names:
             emp_name, emp_data = get_employee_by_name(name, employees)
             if emp_data:
@@ -1813,21 +2322,19 @@ def handle_boss_command(text, from_msisdn):
                     skip_names.append(f"{name} (send fail)")
             else:
                 skip_names.append(f"{name} (map nahi mila)")
-        
+
         # Send confirmation
-        
+
         return
 
     # C. Ask / Status Check (natural language)
     ask_patterns = [
-        r'^ask\s+(\w+)\s+(.+)$',
-        r'^status\s+(\w+)$',
-        r'^pooch\s+(\w+)\s+(.+)$',
-        r'^(\w+)\s+se\s+pooch[yi]*\s+(.+)$',
+        r'^ask\s+(\w+)\s+(.+)$', r'^status\s+(\w+)$',
+        r'^pooch\s+(\w+)\s+(.+)$', r'^(\w+)\s+se\s+pooch[yi]*\s+(.+)$',
         r'^(\w+)\s+ka\s+status\s+pooch[yi]*$',
         r'^(\w+)\s+se\s+pooch[yi]*\s+kaam\s+hua\s+ya\s+nah\??$'
     ]
-    
+
     for pattern in ask_patterns:
         match = re.match(pattern, text, re.IGNORECASE)
         if match:
@@ -1837,18 +2344,24 @@ def handle_boss_command(text, from_msisdn):
             else:
                 name = match.group(1).capitalize()
                 question = "kaam ka status?"
-            
+
             employees = load_employees()
             if name in employees:
                 message = f"Boss ne poocha: \"{question}\" — Meharbani apna short update bhej dein."
                 delivery_result = deliver_to_employee(name, message)
                 if delivery_result["ok"]:
                     schedule_followup(name, employees[name]["msisdn"])
-                    whatsapp_send_text(from_msisdn, f"Message {name} ko bhej diya.")
+                    whatsapp_send_text(from_msisdn,
+                                       f"Message {name} ko bhej diya.")
                 else:
-                    whatsapp_send_text(from_msisdn, f"Send fail {name}. Token/session ya mapping check karein.")
+                    whatsapp_send_text(
+                        from_msisdn,
+                        f"Send fail {name}. Token/session ya mapping check karein."
+                    )
             else:
-                whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+                whatsapp_send_text(
+                    from_msisdn,
+                    f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
             return
 
     # D. Contact / Number
@@ -1857,29 +2370,37 @@ def handle_boss_command(text, from_msisdn):
         name = match.group(1).capitalize()
         employees = load_employees()
         if name in employees:
-            whatsapp_send_text(from_msisdn, f"{name}: {employees[name]['msisdn']}")
+            whatsapp_send_text(from_msisdn,
+                               f"{name}: {employees[name]['msisdn']}")
         else:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
         return
 
     # E. Delivery Preference
     if re.match(r'^pref\s+(\w+)\s+(text|voice|auto)$', text, re.IGNORECASE):
-        match = re.match(r'^pref\s+(\w+)\s+(text|voice|auto)$', text, re.IGNORECASE)
+        match = re.match(r'^pref\s+(\w+)\s+(text|voice|auto)$', text,
+                         re.IGNORECASE)
         name = match.group(1).capitalize()
         pref = match.group(2).lower()
-        
+
         employees = load_employees()
         if name not in employees:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
             return
-        
+
         employees[name]["pref"] = pref
         try:
             with open(STORAGE_PATHS["employees"], "w", encoding="utf-8") as f:
                 json.dump(employees, f, ensure_ascii=False, indent=2)
-            whatsapp_send_text(from_msisdn, f"{name} ki preference '{pref}' set ho gayi.")
+            whatsapp_send_text(from_msisdn,
+                               f"{name} ki preference '{pref}' set ho gayi.")
         except Exception as e:
-            whatsapp_send_text(from_msisdn, f"Preference save karne me issue: {e}")
+            whatsapp_send_text(from_msisdn,
+                               f"Preference save karne me issue: {e}")
         return
 
     # F. Mapping
@@ -1888,33 +2409,40 @@ def handle_boss_command(text, from_msisdn):
         name = match.group(1).capitalize()
         msisdn = match.group(2).strip()
         employees = load_employees()
-        employees[name] = {"msisdn": msisdn, "pref": os.getenv("DELIVERY_DEFAULT", "auto")}
-        
+        employees[name] = {
+            "msisdn": msisdn,
+            "pref": os.getenv("DELIVERY_DEFAULT", "auto")
+        }
+
         try:
             with open(STORAGE_PATHS["employees"], "w", encoding="utf-8") as f:
                 json.dump(employees, f, ensure_ascii=False, indent=2)
-            whatsapp_send_text(from_msisdn, f"{name} ko {msisdn} se map kar diya gaya hai.")
+            whatsapp_send_text(
+                from_msisdn, f"{name} ko {msisdn} se map kar diya gaya hai.")
         except Exception as e:
-            whatsapp_send_text(from_msisdn, f"Mapping save karne me issue: {e}")
+            whatsapp_send_text(from_msisdn,
+                               f"Mapping save karne me issue: {e}")
         return
 
     # G. Voice Forward
     if re.match(r'^forward\s+(?:last\s+)?voice\s+(\w+)$', text, re.IGNORECASE):
-        match = re.match(r'^forward\s+(?:last\s+)?voice\s+(\w+)$', text, re.IGNORECASE)
+        match = re.match(r'^forward\s+(?:last\s+)?voice\s+(\w+)$', text,
+                         re.IGNORECASE)
         name = match.group(1).capitalize()
         last_voice_path = get_last_voice(name)
-        
+
         if not last_voice_path or not Path(last_voice_path).exists():
-            whatsapp_send_text(from_msisdn, f"{name} ke last voice ka record nahi mila.")
+            whatsapp_send_text(from_msisdn,
+                               f"{name} ke last voice ka record nahi mila.")
             return
-        
+
         voice_file = Path(last_voice_path)
         result = wa_send_audio(from_msisdn, voice_file, mark_as_voice=True)
-       
+
         return
 
     # H. Reports
-       # H. Reports
+    # H. Reports
     # Case 1: report <name> → full daily report (all entries of today)
     if re.match(r'^@working\s+(\w+)\s+(.+)$', text, re.IGNORECASE):
         match = re.match(r'^@working\s+(\w+)\s+(.+)$', text, re.IGNORECASE)
@@ -1923,16 +2451,21 @@ def handle_boss_command(text, from_msisdn):
         employees = load_employees()
 
         if name not in employees:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
             return
 
         # Step 1: Boss ka message employee ko bhejna (exact same message)
         polished_message = f"Boss ka working message:\n\n{message}"
         deliver_to_employee(name, polished_message)
         write_report(name, "BOSS -> EMPLOYEE (working) >>>>>>>    ", message)
-        
+
         # Step 2: Employee se analysis ke liye puchhna
-        whatsapp_send_text(employees[name]["msisdn"], f"{name}, boss ne ek working bheji hai. Analysis chahiye? (yes/no)")
+        whatsapp_send_text(
+            employees[name]["msisdn"],
+            f"{name}, boss ne ek working bheji hai. Analysis chahiye? (yes/no)"
+        )
 
         # Step 3: Pending state for boss's request
         BOSS_PENDING.update({
@@ -1944,12 +2477,13 @@ def handle_boss_command(text, from_msisdn):
             "summary": None,
             "ts": int(time.time())
         })
-        
+
         # Step 4: Handling long messages and sending them in chunks
         max_chunk_size = 3500  # WhatsApp's character limit per message
         for i in range(0, len(message), max_chunk_size):
             chunk = message[i:i + max_chunk_size]
-            whatsapp_send_text(from_msisdn, chunk)  # Send chunk to the employee in parts
+            whatsapp_send_text(from_msisdn,
+                               chunk)  # Send chunk to the employee in parts
 
         return
 
@@ -1959,8 +2493,9 @@ def handle_boss_command(text, from_msisdn):
         employees = load_employees()
 
         if name not in employees:
-                       whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
-      
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
 
         # Get the full day's report ...
         # Get and forward the last 12h raw items to Boss (inside read_full_day_report)
@@ -1968,17 +2503,18 @@ def handle_boss_command(text, from_msisdn):
         whatsapp_send_text(from_msisdn, status)
         return
 
-
-
     # Case 2: report <name> text/pdf/voice → AI summary formats
     if re.match(r'^report\s+(\w+)\s+(text|pdf|voice)$', text, re.IGNORECASE):
-        match = re.match(r'^report\s+(\w+)\s+(text|pdf|voice)$', text, re.IGNORECASE)
+        match = re.match(r'^report\s+(\w+)\s+(text|pdf|voice)$', text,
+                         re.IGNORECASE)
         name = match.group(1).capitalize()
         report_format = match.group(2).lower()
-        
+
         employees = load_employees()
         if name not in employees:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
             return
 
         if report_format == "text":
@@ -1987,60 +2523,75 @@ def handle_boss_command(text, from_msisdn):
         elif report_format == "pdf":
             summary = build_ai_summary_text(name)
             report_content = read_report(name)
-            image_notes = re.findall(r"IMAGE -> ANALYSIS\n(.*?)(?=\n---|\Z)", report_content, re.DOTALL)[-3:]
-            pdf_notes = re.findall(r"PDF -> ANALYSIS:.*?\n(.*?)(?=\n---|\Z)", report_content, re.DOTALL)[-3:]
-            
-            out_path = STORAGE_PATHS["reports_out"] / f"{name}_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-            if make_report_pdf(name, summary, image_notes, pdf_notes, out_path):
+            image_notes = re.findall(r"IMAGE -> ANALYSIS\n(.*?)(?=\n---|\Z)",
+                                     report_content, re.DOTALL)[-3:]
+            pdf_notes = re.findall(r"PDF -> ANALYSIS:.*?\n(.*?)(?=\n---|\Z)",
+                                   report_content, re.DOTALL)[-3:]
+
+            out_path = STORAGE_PATHS[
+                "reports_out"] / f"{name}_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+            if make_report_pdf(name, summary, image_notes, pdf_notes,
+                               out_path):
                 send_pdf_to_boss(out_path, name)
             else:
-                whatsapp_send_text(from_msisdn, f"{name} ki PDF report banane me issue hai.")
+                whatsapp_send_text(
+                    from_msisdn, f"{name} ki PDF report banane me issue hai.")
         elif report_format == "voice":
             summary = build_ai_summary_text(name)
-            tts_path = STORAGE_PATHS["reports_out"] / f"{name}_report_{datetime.now().strftime('%Y%m%d_%H%M')}.mp3"
+            tts_path = STORAGE_PATHS[
+                "reports_out"] / f"{name}_report_{datetime.now().strftime('%Y%m%d_%H%M')}.mp3"
             if tts_to_file(summary, tts_path):
-                result = wa_send_audio(from_msisdn, media_id=None, link=str(Path(pth)), mark_as_voice=True)
+                result = wa_send_audio(from_msisdn,
+                                       media_id=None,
+                                       link=str(Path(pth)),
+                                       mark_as_voice=True)
 
-               
-                
         return
-    
+
     if re.match(r'^report\s+all\s+(text|pdf)$', text, re.IGNORECASE):
         match = re.match(r'^report\s+all\s+(text|pdf)$', text, re.IGNORECASE)
         report_format = match.group(1).lower()
         employees = load_employees()
-        
+
         if report_format == "text":
             all_summaries = {}
             for name in employees.keys():
                 summary = build_ai_summary_text(name)
                 all_summaries[name] = summary
-            
-            combined_text = "\n\n".join([f"--- {name} ---\n{summary}" for name, summary in all_summaries.items()])
+
+            combined_text = "\n\n".join([
+                f"--- {name} ---\n{summary}"
+                for name, summary in all_summaries.items()
+            ])
             for i in range(0, len(combined_text), 3500):
-                whatsapp_send_text(from_msisdn, combined_text[i:i+3500])
-           
+                whatsapp_send_text(from_msisdn, combined_text[i:i + 3500])
+
         elif report_format == "pdf":
             all_summaries = {}
             for name in employees.keys():
                 summary = build_ai_summary_text(name)
                 all_summaries[name] = summary
-            
-            out_path = STORAGE_PATHS["reports_out"] / f"combined_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+
+            out_path = STORAGE_PATHS[
+                "reports_out"] / f"combined_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
             if make_report_pdf_all(all_summaries, out_path):
                 send_pdf_to_boss(out_path, "Combined")
             else:
-                whatsapp_send_text(from_msisdn, "Combined PDF report banane me issue hai.")
+                whatsapp_send_text(from_msisdn,
+                                   "Combined PDF report banane me issue hai.")
         return
-
 
     # I. Boss Identity
     if re.match(r'^setboss\s+(\d+)$', text, re.IGNORECASE):
         match = re.match(r'^setboss\s+(\d+)$', text, re.IGNORECASE)
         new_boss_id = match.group(1).strip()
         update_boss_number(new_boss_id)
-        whatsapp_send_text(from_msisdn, f"Boss number set ho gaya: {new_boss_id}. Ab aap commands use kar sakte hain.")
-        whatsapp_send_text(new_boss_id, "Aap ko boss ke tor par confirm kar diya gaya hai.")
+        whatsapp_send_text(
+            from_msisdn,
+            f"Boss number set ho gaya: {new_boss_id}. Ab aap commands use kar sakte hain."
+        )
+        whatsapp_send_text(
+            new_boss_id, "Aap ko boss ke tor par confirm kar diya gaya hai.")
         return
 
     # J. Docs command
@@ -2062,30 +2613,41 @@ Agar voice aayegi to aap se poochun ga: transcript chahiye?"""
     if re.match(r'^employees?$', text, re.IGNORECASE):
         employees = load_employees()
         if not employees:
-            whatsapp_send_text(from_msisdn, "Koi employees map nahi hain. Use: map <Name> <msisdn>")
+            whatsapp_send_text(
+                from_msisdn,
+                "Koi employees map nahi hain. Use: map <Name> <msisdn>")
             return
-        
+
         employee_list = []
         for name, data in employees.items():
             masked_msisdn = mask_msisdn(data["msisdn"])
             pref = data.get("pref", "auto")
             employee_list.append(f"{name} — {masked_msisdn} — pref: {pref}")
-        
+
         response = "Employees:\n" + "\n".join(employee_list)
         whatsapp_send_text(from_msisdn, response)
         return
-
 
     m = re.match(r'^analyze\s+(\w+)$', text, re.IGNORECASE)
     if m:
         emp = m.group(1).capitalize()
         run_grouped_analysis_for_report(emp, to_msisdn=from_msisdn)
-        BOSS_PENDING = {"active": False, "awaiting_format": False, "kind": None, "employee": None,
-                        "path": None, "filename": None, "text": None, "transcript": None, "summary": None, "ts": 0}
+        BOSS_PENDING = {
+            "active": False,
+            "awaiting_format": False,
+            "kind": None,
+            "employee": None,
+            "path": None,
+            "filename": None,
+            "text": None,
+            "transcript": None,
+            "summary": None,
+            "ts": 0
+        }
         return
 
     # L. Followup command
-   
+
     # Case 1: report <name> → full daily report (all entries of today)
     if re.match(r'^@working\s+(\w+)\s+(.+)$', text, re.IGNORECASE):
         match = re.match(r'^@working\s+(\w+)\s+(.+)$', text, re.IGNORECASE)
@@ -2094,51 +2656,76 @@ Agar voice aayegi to aap se poochun ga: transcript chahiye?"""
         employees = load_employees()
 
         if name not in employees:
-            whatsapp_send_text(from_msisdn, f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
+            whatsapp_send_text(
+                from_msisdn,
+                f"'{name}' map nahi. Use: map {name} 923XXXXXXXXX")
             return
 
         # Step 1: Boss ka message employee ko bhejna (exact same message)
         polished_message = f"Boss ka working message:\n\n{message}"
         deliver_to_employee(name, polished_message)
         write_report(name, "BOSS -> EMPLOYEE (working)", message)
-        
+
         # Step 2: Employee se analysis ke liye puchhna
-       # Step 2: Employee se analysis ke liye puchhna
-        whatsapp_send_text(employees[name]["msisdn"], f"{name}, Boss ne working bheji hai. Analysis chahiye? (yes/no)")
+        # Step 2: Employee se analysis ke liye puchhna
+        whatsapp_send_text(
+            employees[name]["msisdn"],
+            f"{name}, Boss ne working bheji hai. Analysis chahiye? (yes/no)")
 
         # Step 3: Pending state for EMPLOYEE
         EMP_PENDING[name] = {
             "active": True,
-            "items": {"text": message, "images": [], "docs": [], "audio": []},
+            "items": {
+                "text": message,
+                "images": [],
+                "docs": [],
+                "audio": []
+            },
             "ts": int(time.time())
         }
-
 
         # Step 4: Handling long messages and sending them in chunks
         max_chunk_size = 3500  # WhatsApp's character limit per message
         for i in range(0, len(message), max_chunk_size):
             chunk = message[i:i + max_chunk_size]
-            whatsapp_send_text(from_msisdn, chunk)  # Send chunk to the employee in parts
+            whatsapp_send_text(from_msisdn,
+                               chunk)  # Send chunk to the employee in parts
 
         return
 
+
 def handle_employee_message(text, from_msisdn, sender_name):
-    
+
     global LAST_MEDIA, BOSS_PENDING
     tnorm = (text or "").strip().lower()
     if EMP_PENDING.get(sender_name, {}).get("active"):
-        if tnorm in {"yes", "y", "haan", "han", "ji", "ok", "analyze", "analysis"}:
+        if tnorm in {
+                "yes", "y", "haan", "han", "ji", "ok", "analyze", "analysis"
+        }:
             employee_send_combined_analysis(sender_name, from_msisdn)
             return
         elif tnorm in {"no", "n", "skip", "nah", "na"}:
             EMP_PENDING.pop(sender_name, None)
-            whatsapp_send_text(from_msisdn, "Theek hai, analysis skip kar diya.")
+            whatsapp_send_text(from_msisdn,
+                               "Theek hai, analysis skip kar diya.")
             return
+    if text.lower().strip() in ["done", "completed", "finished"]:
+        log_event("TASK_DONE", sender_name,
+                  f"{sender_name} marked task as completed.")
+        whatsapp_send_text(
+            from_msisdn,
+            "✅ Task submitted successfully and sent to management.")
+        whatsapp_send_text(
+            BOSS_WA_ID, f"📩 {sender_name} has submitted their task update.")
+        return
+
     if text.lower().startswith("done"):
         # Handle "done" message
-        write_report(sender_name, "EMPLOYEE -> UPDATE", text , sender="Employee")
-    
-        
+        write_report(sender_name,
+                     "EMPLOYEE -> UPDATE",
+                     text,
+                     sender="Employee")
+
         # Check if there are any media to send
         if LAST_MEDIA.get("type"):
             media_messages = []
@@ -2156,23 +2743,30 @@ def handle_employee_message(text, from_msisdn, sender_name):
                     elif media["type"] == "image":
                         wa_send_image(BOSS_WA_ID, media["id"])
                     elif media["type"] == "pdf":
-                        wa_send_document(BOSS_WA_ID, media["id"], media["filename"])
-                whatsapp_send_text(BOSS_WA_ID, f"Boss, {sender_name} ke {len(media_messages)} items forward ho gaye hain. Apko short analysis chahiye?")
+                        wa_send_document(BOSS_WA_ID, media["id"],
+                                         media["filename"])
+                whatsapp_send_text(
+                    BOSS_WA_ID,
+                    f"Boss, {sender_name} ke {len(media_messages)} items forward ho gaye hain. Apko short analysis chahiye?"
+                )
         return
     elif text.lower().startswith("delay"):
         # Handle "delay" message
         write_report(sender_name, "EMPLOYEE -> DELAY", text)
-        
-       
+
         return
     # General update
-    write_report(sender_name, "EMPLOYEE -> UPDATE", text , sender="Employee")
-    
-    
-    # Offer analysis to boss for text updates
-    
+    write_report(sender_name, "EMPLOYEE -> UPDATE", text, sender="Employee")
 
-def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None, filename=None):
+    # Offer analysis to boss for text updates
+
+
+def handle_media(media_type,
+                 media_id,
+                 from_msisdn,
+                 sender_name,
+                 mime_type=None,
+                 filename=None):
     global LAST_MEDIA
     date_str = datetime.now().strftime("%Y-%m-%d")
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2183,7 +2777,8 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
 
     # --- IMAGE ---
     if media_type == "image":
-        file_path = wa_download_media(media_id, media_dir / f"image_{ts_str}.jpg")
+        file_path = wa_download_media(media_id,
+                                      media_dir / f"image_{ts_str}.jpg")
         ack_msg = "Image receive ho gayi."
 
         if file_path:
@@ -2191,44 +2786,62 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
             res = wa_upload_media(file_path)
             if res["ok"]:
                 mid = res["media_id"]
-                write_report(sender_name, "EMPLOYEE -> BOSS (image)", filename or file_path.name,
+                write_report(sender_name,
+                             "EMPLOYEE -> BOSS (image)",
+                             filename or file_path.name,
                              sender="Employee")
                 # Save in JSON thread with media_id
-                write_report(sender_name, "EMPLOYEE_MEDIA", {
+                write_report(sender_name,
+                             "EMPLOYEE_MEDIA", {
+                                 "type": "image",
+                                 "filename": file_path.name,
+                                 "media_id": mid,
+                                 "local_path": str(file_path)
+                             },
+                             sender="Employee")
+                LAST_MEDIA = {
                     "type": "image",
                     "filename": file_path.name,
+                    "sender": sender_name,
                     "media_id": mid,
                     "local_path": str(file_path)
-                }, sender="Employee")
-                LAST_MEDIA = {"type": "image", "filename": file_path.name,
-                              "sender": sender_name, "media_id": mid,
-                              "local_path": str(file_path)}
+                }
 
     # --- DOCUMENT / PDF ---
     elif media_type == "document":
         ext = Path(filename).suffix if filename else ".bin"
-        file_path = wa_download_media(media_id, media_dir / f"doc_{ts_str}{ext}")
+        file_path = wa_download_media(media_id,
+                                      media_dir / f"doc_{ts_str}{ext}")
         ack_msg = "Document receive ho gaya."
 
         if file_path:
             res = wa_upload_media(file_path)
             if res["ok"]:
                 mid = res["media_id"]
-                write_report(sender_name, "EMPLOYEE -> BOSS (document)", filename or file_path.name,
+                write_report(sender_name,
+                             "EMPLOYEE -> BOSS (document)",
+                             filename or file_path.name,
                              sender="Employee")
-                write_report(sender_name, "EMPLOYEE_MEDIA", {
+                write_report(sender_name,
+                             "EMPLOYEE_MEDIA", {
+                                 "type": "document",
+                                 "filename": file_path.name,
+                                 "media_id": mid,
+                                 "local_path": str(file_path)
+                             },
+                             sender="Employee")
+                LAST_MEDIA = {
                     "type": "document",
                     "filename": file_path.name,
+                    "sender": sender_name,
                     "media_id": mid,
                     "local_path": str(file_path)
-                }, sender="Employee")
-                LAST_MEDIA = {"type": "document", "filename": file_path.name,
-                              "sender": sender_name, "media_id": mid,
-                              "local_path": str(file_path)}
+                }
 
     # --- AUDIO / VOICE ---
     elif media_type == "audio":
-        file_path = wa_download_media(media_id, media_dir / f"audio_{ts_str}.ogg")
+        file_path = wa_download_media(media_id,
+                                      media_dir / f"audio_{ts_str}.ogg")
         ack_msg = "Voice note receive ho gaya."
 
         if file_path:
@@ -2236,95 +2849,737 @@ def handle_media(media_type, media_id, from_msisdn, sender_name, mime_type=None,
             if res["ok"]:
                 mid = res["media_id"]
                 save_last_voice(sender_name, file_path)
-                write_report(sender_name, "EMPLOYEE -> BOSS (audio)", file_path.name, sender="Employee")
-                write_report(sender_name, "EMPLOYEE_MEDIA", {
+                write_report(sender_name,
+                             "EMPLOYEE -> BOSS (audio)",
+                             file_path.name,
+                             sender="Employee")
+                write_report(sender_name,
+                             "EMPLOYEE_MEDIA", {
+                                 "type": "audio",
+                                 "filename": file_path.name,
+                                 "media_id": mid,
+                                 "local_path": str(file_path)
+                             },
+                             sender="Employee")
+                LAST_MEDIA = {
                     "type": "audio",
                     "filename": file_path.name,
+                    "sender": sender_name,
                     "media_id": mid,
                     "local_path": str(file_path)
-                }, sender="Employee")
-                LAST_MEDIA = {"type": "audio", "filename": file_path.name,
-                              "sender": sender_name, "media_id": mid,
-                              "local_path": str(file_path)}
+                }
 
     # Send ack to employee only
     if ack_msg:
         whatsapp_send_text(from_msisdn, ack_msg)
 
-# Legacy socketserver-based HTTP handler removed; webhook is served by FastAPI endpoints above.
 
-async def init_db():
-    """placeholder so startup doesn't crash"""
-    return True
-
-def process_message(message: dict):
-    """Handle incoming WhatsApp message and route to correct logic."""
+# ===========================================================
+# 🔹 DOWNLOAD WHATSAPP MEDIA FILE
+# ===========================================================
+def download_whatsapp_media(media_id: str, output_path: str) -> tuple:
+    """
+    Downloads media from WhatsApp Cloud API.
+    Returns: (success: bool, file_path: str, mime_type: str)
+    """
     try:
-        sender = message.get("from")
+        # Step 1: Get media URL from media ID
+        media_info_url = f"https://graph.facebook.com/v19.0/{media_id}"
+        headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+
+        response = requests.get(media_info_url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ Failed to get media info: {response.status_code}")
+            return (False, "", "")
+
+        media_data = response.json()
+        download_url = media_data.get("url")
+        mime_type = media_data.get("mime_type", "")
+
+        if not download_url:
+            print("❌ No download URL in media response")
+            return (False, "", "")
+
+        # Step 2: Download the actual file
+        media_response = requests.get(download_url,
+                                      headers=headers,
+                                      timeout=30)
+        if media_response.status_code != 200:
+            print(f"❌ Failed to download media: {media_response.status_code}")
+            return (False, "", "")
+
+        # Determine file extension from MIME type
+        ext_map = {
+            "image/jpeg":
+            ".jpg",
+            "image/png":
+            ".png",
+            "image/webp":
+            ".webp",
+            "audio/ogg":
+            ".ogg",
+            "audio/mpeg":
+            ".mp3",
+            "audio/mp4":
+            ".m4a",
+            "application/pdf":
+            ".pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            ".docx",
+            "video/mp4":
+            ".mp4"
+        }
+        ext = ext_map.get(mime_type, ".bin")
+
+        # Save file
+        full_path = output_path + ext
+        Path(full_path).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(full_path, "wb") as f:
+            f.write(media_response.content)
+
+        print(f"✅ Downloaded media to: {full_path}")
+        return (True, full_path, mime_type)
+
+    except Exception as e:
+        print(f"❌ download_whatsapp_media() failed: {e}")
+        return (False, "", "")
+
+
+# ===========================================================
+# 🔹 UNIVERSAL FILE ANALYZER (Document / Image / Audio / Voice)
+# ===========================================================
+def analyze_any_file(file_url: str, mime_type: str, sender_name: str) -> str:
+    """
+    Downloads file, extracts content, and analyzes with GPT-4.
+    Returns English + Roman Urdu summary.
+    """
+    try:
+        # Extract media ID from file_url (it's the media ID from WhatsApp)
+        media_id = file_url if not file_url.startswith("http") else None
+
+        if not media_id:
+            return "⚠️ Invalid file reference."
+
+        # Download the file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_base = f"media/{sender_name}_{timestamp}"
+        success, local_file_path, mime_type = download_whatsapp_media(
+            media_id, output_base)
+
+        if not success:
+            return "⚠️ Could not download file. Please try again."
+
+        # Extract text content based on file type
+        file_content = ""
+
+        if mime_type == "application/pdf":
+            # Extract text from PDF
+            try:
+                from pdfminer.high_level import extract_text as pdf_extract
+                file_content = pdf_extract(local_file_path)
+            except Exception as e:
+                print(f"⚠️ PDF extraction failed: {e}")
+                file_content = "[PDF file - text extraction failed]"
+
+        elif "wordprocessingml" in mime_type or mime_type.endswith(".docx"):
+            # Extract text from DOCX
+            try:
+                from docx import Document
+                doc = Document(local_file_path)
+                file_content = "\n".join(
+                    [para.text for para in doc.paragraphs])
+            except Exception as e:
+                print(f"⚠️ DOCX extraction failed: {e}")
+                file_content = "[DOCX file - text extraction failed]"
+
+        elif "image" in mime_type:
+            # Use GPT-4o Vision to analyze image directly
+            try:
+                image_prompt = f"""Analyze this image uploaded by {sender_name}. Describe what you see in detail, including text, objects, people, or any relevant information.
+
+Provide your analysis in this format:
+
+*Summary (English):*
+[Your English analysis here]
+
+*Summary (Roman Urdu):*
+[Your Roman Urdu analysis here - use Romanized Urdu script]"""
+
+                vision_analysis = analyze_image_with_gpt(
+                    local_file_path, image_prompt)
+                if vision_analysis:
+                    return f"📄 *Document Summary:*\n{vision_analysis}\n\n✅ File analyzed & forwarded to Boss successfully."
+                else:
+                    return f"📄 Image received and saved at: {local_file_path}\n⚠️ Vision analysis temporarily unavailable."
+            except Exception as e:
+                print(f"⚠️ Image analysis failed: {e}")
+                return f"📄 Image file saved.\n⚠️ Analysis failed: {str(e)}"
+
+        elif "audio" in mime_type:
+            # Transcribe audio with Whisper STT (primary) or ElevenLabs (fallback)
+            try:
+                transcription = None
+
+                # Try Whisper first (OpenAI)
+                if whisper_transcribe_audio:
+                    transcription = whisper_transcribe_audio(local_file_path)
+
+                # Fallback to ElevenLabs STT if Whisper fails
+                if not transcription and stt_from_mp3:
+                    transcription = stt_from_mp3(local_file_path)
+
+                if transcription:
+                    file_content = f"Audio transcription:\n{transcription}"
+                    # Analyze transcription with GPT
+                    prompt = f"""Analyze this audio transcription from {sender_name}:
+{transcription}
+
+Provide summary in this format:
+
+*Summary (English):*
+[Your English analysis here]
+
+*Summary (Roman Urdu):*
+[Your Roman Urdu analysis here - use Romanized Urdu script]"""
+
+                    reply = get_reply_from_ai(sender_name,
+                                              prompt,
+                                              use_memory=True)
+                    if reply:
+                        return f"📄 *Document Summary:*\n{reply}\n\n✅ File analyzed & forwarded to Boss successfully."
+                    else:
+                        return f"📄 Audio Transcription:\n{transcription}"
+                else:
+                    return "📄 Audio file saved.\n⚠️ Transcription service temporarily unavailable.\n⚠️ Audio transcription abhi unavailable hai."
+            except Exception as e:
+                print(f"⚠️ Audio transcription failed: {e}")
+                return "📄 Audio file saved.\n⚠️ Transcription failed. Please try again later.\n⚠️ Audio transcription me issue hai. Baad me try karein."
+        else:
+            file_content = f"[File saved at: {local_file_path}]"
+
+        # For PDF/DOCX: Build prompt with extracted content for GPT
+        prompt = f"""Analyze this file from {sender_name}:
+Type: {mime_type}
+Content:
+{file_content[:2000]}
+
+Provide summary in this format:
+
+*Summary (English):*
+[Your English analysis here - highlight key points or required actions]
+
+*Summary (Roman Urdu):*
+[Your Roman Urdu analysis here - use Romanized Urdu script]"""
+
+        # Use GPT for analysis
+        reply = get_reply_from_ai(sender_name, prompt)
+        if not reply:
+            return f"📄 File received and saved.\nType: {mime_type}\nPreview: {file_content[:300]}"
+
+        return f"📄 *Document Summary:*\n{reply}\n\n✅ File analyzed & forwarded to Boss successfully."
+
+    except Exception as e:
+        print(f"❌ analyze_any_file() failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"⚠️ Error analyzing file: {str(e)}"
+
+
+def get_todays_logs_for_employee(emp_name: str,
+                                 log_file="/home/runner/workspace/events.jsonl"
+                                 ):
+    """Generate today's activity summary for a specific employee (case-insensitive)."""
+    today = datetime.utcnow().date()
+    results = []
+    emp_name_lower = emp_name.lower()
+
+    try:
+        with open(log_file, "r") as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    # Case-insensitive employee comparison
+                    record_emp = str(record.get("employee", "")).lower()
+                    if record_emp == emp_name_lower:
+                        ts = datetime.fromisoformat(
+                            record.get("at", "").replace("Z",
+                                                         "+00:00")).date()
+                        if ts == today:
+                            kind = record.get("kind", "UNKNOWN")
+                            msg = record.get("payload",
+                                             {}).get("text",
+                                                     {}).get("body", "")
+                            event = record.get("event", "")
+                            # Include both payload messages and event descriptions
+                            if msg:
+                                results.append(f"• {kind}: {msg}")
+                            elif event:
+                                results.append(f"• {kind}: {event}")
+                except Exception:
+                    continue
+
+        if not results:
+            return f"No activities logged for {emp_name} today.\n\nAaj {emp_name} ki koi activity log nahi hai."
+
+        return f"📊 *Today's Report for {emp_name}:*\n" + "\n".join(results)
+    except FileNotFoundError:
+        return "⚠️ Log file not found. No report generated.\n\nLog file nahi mili."
+
+
+def log_event(kind, employee, event_text):
+    try:
+        record = {
+            "at": datetime.utcnow().isoformat() + "Z",
+            "kind": kind,
+            "employee": employee,
+            "event": event_text,
+        }
+        with FileLock("events.jsonl.lock"):
+            with open("events.jsonl", "a") as f:
+                f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"⚠️ Log write error: {e}")
+
+
+def log_task_event(emp_name: str, event: str, kind: str = "ACTIVITY"):
+    """Log a task or completion update into events.jsonl with proper formatting."""
+    # Ensure all fields are strings and not None
+    emp_name = str(emp_name) if emp_name else "unknown"
+    event = str(event) if event else ""
+    kind = str(kind) if kind else "ACTIVITY"
+
+    record = {
+        "at": now_iso(),
+        "employee": emp_name,
+        "event": event,
+        "kind": kind
+    }
+
+    try:
+        with FileLock("events.jsonl.lock", timeout=2):
+            with open("events.jsonl", "a") as f:
+                f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"⚠️ Error logging task: {e}")
+
+
+def handle_incoming_whatsapp_message(message: dict):
+    """Handle incoming WhatsApp message and route it to correct logic."""
+    try:
+        sender = normalize_msisdn(message.get("from", ""))
+
+        # Safely normalize boss ID
+        try:
+            boss_id = normalize_msisdn(BOSS_WA_ID)
+        except Exception as e:
+            print(f"⚠️ Boss ID normalization failed: {e}")
+            # Fallback: manually normalize by removing + and spaces
+            boss_id = str(BOSS_WA_ID).replace("+", "").replace(" ", "").strip()
+
+        sender_name = sender  # default name for analysis
+
         msg_id = message.get("id")
         msg_type = message.get("type", "")
         text = ""
 
-        # Extract text from the message
+        # --- Extract message content ---
         if msg_type == "text":
             text = message.get("text", {}).get("body", "").strip()
         elif msg_type == "button":
             text = message.get("button", {}).get("text", "").strip()
         elif msg_type == "interactive":
             text = "[interactive reply]"
-        elif msg_type == "audio":
+        elif msg_type in ["audio", "voice"]:
             text = "[voice note]"
-        elif msg_type == "image":
-            text = "[image]"
+        elif msg_type in ["image", "document"]:
+            text = f"[{msg_type}]"
         else:
             text = "[unsupported message]"
 
-        # Avoid duplicate processing
+        # --- Avoid duplicate messages ---
         if msg_id and is_message_seen(msg_id):
             return
         if msg_id:
             save_seen_message_id(msg_id)
 
-        # Check if message is from Boss
-        if sender == BOSS_WA_ID:
+        # ===============================================================
+        # 🔹 Case 1: Message from Boss
+        # ===============================================================
+        if sender == boss_id:
             print(f"📩 Boss message: {text}")
-            handle_boss_command(text, sender)
-        else:
-            # Identify employee name by number
-            employees = load_employees()
-            emp_name = None
-            for name, data in employees.items():
-                if data.get("msisdn") == sender:
-                    emp_name = name
-                    break
+            # 🔹 Intercept clone/report/employees for multi-agent routing
+            if os.getenv("ENABLE_MULTI_AGENT",
+                         "false").lower() == "true" and MULTI_AGENT_AVAILABLE:
+                lowtxt = text.lower().strip()
 
-            if emp_name:
-                print(f"👷 Employee message from {emp_name}: {text}")
-                handle_employee_message(text, sender, emp_name)
+                if lowtxt.startswith("clone "):
+                    name = lowtxt.split(" ", 1)[1]
+                    route_to_multi_agent("orchestrator", {
+                        "cmd": "clone",
+                        "name": name
+                    })
+                    whatsapp_send_text(
+                        sender, f"🧬 Multi-Agent cloning started for {name}")
+                    return
+
+                elif lowtxt.startswith("report "):
+                    name = lowtxt.split(" ", 1)[1]
+                    route_to_multi_agent("reporting_agent", {
+                        "cmd": "report",
+                        "name": name
+                    })
+                    whatsapp_send_text(
+                        sender, f"📊 Multi-Agent generating report for {name}")
+                    return
+
+                elif lowtxt == "employees":
+                    route_to_multi_agent("conversation_agent",
+                                         {"cmd": "list_employees"})
+                    whatsapp_send_text(
+                        sender,
+                        "👥 Fetching employee list via Multi-Agent system...")
+                    return
+
+                elif lowtxt == "employees":
+                    route_to_multi_agent("conversation_agent",
+                                         {"cmd": "list_employees"})
+                    whatsapp_send_text(
+                        sender,
+                        "👥 Fetching employee list via Multi-Agent system...")
+                    return  # ✅ stop here too
+
+                elif lowtxt == "employees":
+                    route_to_multi_agent("conversation_agent",
+                                         {"cmd": "list_employees"})
+                    whatsapp_send_text(
+                        sender,
+                        "👥 Fetching employee list via Multi-Agent system...")
+                    return  # ✅ stop here too
+
+            # Safely handle text conversion to lowercase
+            if not text or not isinstance(text, str):
+                text = ""
+
+            lower_text = text.lower().strip()
+
+            # Show available commands
+            if lower_text in ["doc", "docs", "help"]:
+                whatsapp_send_text(
+                    sender, "📘 Available Commands:\n"
+                    "• map <name> <number> — Add new employee\n"
+                    "• @tasks <name> — Assign a new task\n"
+                    "• @send — Send assigned task\n"
+                    "• report <name> — Get today’s employee report\n"
+                    "• employees — List all registered staff")
+                return
+
+            # List all employees
+            elif lower_text.startswith("employees"):
+                employees = load_employees()
+                staff = "\n".join([
+                    f"• {k} ({v.get('msisdn')})" for k, v in employees.items()
+                ])
+                whatsapp_send_text(
+                    sender,
+                    f"👥 Registered Employees:\n{staff or 'No employees yet.'}")
+                return
+
+            # Map new employee
+            elif lower_text.startswith("map "):
+                parts = lower_text.split()
+                if len(parts) >= 3:
+                    name, number = parts[1], parts[2]
+                    employees = load_employees()
+                    employees[name] = {"msisdn": number, "pref": "text"}
+                    with open("employees.json", "w") as f:
+                        json.dump(employees, f, indent=2)
+                    whatsapp_send_text(sender, f"✅ Mapped {name} → {number}")
+                else:
+                    whatsapp_send_text(sender,
+                                       "⚠️ Use format: map <name> <number>")
+                return
+
+            # Change employee preference
+            elif lower_text.startswith("pref "):
+                parts = lower_text.split()
+                if len(parts) >= 3:
+                    search_name = parts[1]
+                    pref_type = parts[2].lower()
+                    if pref_type not in ["text", "voice"]:
+                        whatsapp_send_text(
+                            sender, "⚠️ Preference must be 'text' or 'voice'")
+                        return
+                    employees = load_employees()
+                    # Use case-insensitive lookup via get_employee_by_name
+                    real_name, emp_data = get_employee_by_name(
+                        search_name, employees)
+                    if real_name:
+                        employees[real_name]["pref"] = pref_type
+                        with open("employees.json", "w") as f:
+                            json.dump(employees, f, indent=2)
+                        whatsapp_send_text(
+                            sender,
+                            f"✅ Updated {real_name}'s preference to {pref_type}"
+                        )
+                    else:
+                        whatsapp_send_text(
+                            sender, f"⚠️ Employee '{search_name}' not found")
+                else:
+                    whatsapp_send_text(
+                        sender, "⚠️ Use format: pref <name> <text/voice>")
+                return
+
+            # Assign task
+            elif lower_text.startswith("@tasks "):
+                target = lower_text.replace("@tasks", "").strip()
+                whatsapp_send_text(
+                    sender,
+                    f"📝 Write your task for {target}, then send '@send' to confirm."
+                )
+                global pending_task
+                pending_task = {
+                    "to": target,
+                    "body": "",
+                    "waiting_for_message": True
+                }
+                return
+
+            # Confirm and send task
+            elif lower_text == "@send":
+                if "pending_task" in globals() and pending_task.get("to"):
+                    target = pending_task["to"]
+                    task_body = pending_task.get("body", "No content.")
+                    employees = load_employees()
+                    if target in employees:
+                        deliver_to_employee(target,
+                                            f"🧾 New Assignment:\n{task_body}")
+                        whatsapp_send_text(sender, f"📤 Task sent to {target}.")
+                        log_task_event(target, f"Task assigned: {task_body}")
+                    else:
+                        whatsapp_send_text(
+                            sender, f"⚠️ Employee '{target}' not found.")
+                    pending_task.clear()
+                else:
+                    whatsapp_send_text(sender, "⚠️ No pending task to send.")
+                return
+
+            # ------------------- REPORT COMMAND -------------------
+            elif lower_text.startswith("report "):
+                emp = lower_text.replace("report", "").strip()
+                whatsapp_send_text(sender, f"📑 Generating report for {emp}...")
+
+                today = datetime.utcnow().date()
+                entries = []
+                try:
+                    with open("events.jsonl", "r") as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            try:
+                                data = json.loads(line)
+                            except Exception:
+                                continue
+
+                            employee = str(data.get("employee", "")).strip()
+                            if employee.lower() != emp.lower():
+                                continue
+
+                            ts = data.get("at", "")
+                            if not ts:
+                                continue
+                            try:
+                                ts_date = datetime.fromisoformat(
+                                    ts.replace("Z", "+00:00")).date()
+                            except Exception:
+                                continue
+
+                            if ts_date == today:
+                                entries.append(data.get("event", ""))
+                except Exception as e:
+                    whatsapp_send_text(sender, f"⚠️ Error reading logs: {e}")
+                    return
+
+                if not entries:
+                    whatsapp_send_text(
+                        sender, f"No activities logged for {emp} today.")
+                    return
+
+                joined = "\n".join(entries)
+                prompt = (
+                    f"Summarize today's performance report for employee '{emp}'.\n"
+                    f"Entries:\n{joined}\n\n"
+                    "Write in professional English and Roman Urdu, summarizing all tasks, performance, and results."
+                )
+
+                try:
+                    report = get_reply_from_ai("Boss", prompt)
+                    if not report:
+                        report = "AI temporarily unavailable. Please try again later."
+                except Exception as e:
+                    report = f"AI failed: {e}"
+
+                whatsapp_send_text(sender, report)
+                return
+
+            # ------------------- CAPTURE TASK MESSAGE -------------------
+            elif "pending_task" in globals() and pending_task.get(
+                    "waiting_for_message"):
+                pending_task["body"] = text
+                pending_task["waiting_for_message"] = False
+                whatsapp_send_text(
+                    sender,
+                    f"✅ Task captured. Send '@send' to deliver it to {pending_task['to']}"
+                )
+                return
+
+            # ------------------- DEFAULT AI FALLBACK -------------------
             else:
-                print(f"⚠️ Unknown sender: {sender}")
-                whatsapp_send_text(sender, "Aap system me map nahi hain. Boss se 'map Name <number>' karwayen.")
-                whatsapp_send_text(BOSS_WA_ID, f"New number {sender} ne message bheja. Use map karne ke liye likhein:\nmap Name {sender}")
+                try:
+                    reply = get_reply_from_ai("Boss", text)
+                    whatsapp_send_text(sender, reply)
+                except Exception as e:
+                    print(f"⚠️ AI error for boss: {e}")
+                    whatsapp_send_text(sender, f"⚠️ Error: {e}")
+
+            # Always return after handling boss message - prevent fallthrough
+            return
+
+
+# ===============================================================
+# 🔹 Case 2: Message from Employee
+# ===============================================================
+        employees = load_employees()
+        emp_name = None
+        for name, data in employees.items():
+            emp_num = normalize_msisdn(data.get("msisdn", ""))
+            if emp_num == sender:
+                emp_name = name
+                break
+
+        if emp_name:
+            print(f"👷 Employee message from {emp_name}: {text}")
+            sender_name = emp_name
+
+            # Safely handle text for employee messages
+            if not text or not isinstance(text, str):
+                text = ""
+
+            # --- Log all employee activities
+            safe_text = text[:100] if text else ""
+            log_task_event(emp_name, f"Message: {safe_text}")
+
+            # --- Check for completion keywords
+            completion_keywords = [
+                "done", "completed", "finished", "complete", "done hai",
+                "ho gaya"
+            ]
+            if text and any(keyword in text.lower()
+                            for keyword in completion_keywords):
+                log_task_event(emp_name, f"✅ TASK COMPLETED: {text}")
+                whatsapp_send_text(
+                    sender,
+                    "✅ Task completion logged. Boss ko notify kar diya.")
+                whatsapp_send_text(
+                    BOSS_WA_ID,
+                    f"✅ {emp_name} ne task complete kar diya: {text}")
+                return
+
+            # --- Media messages (PDF, DOCX, Image, Audio)
+            if msg_type in ["document", "image", "audio"]:
+                file_data = message.get(msg_type, {})
+                media_id = file_data.get("id")  # Get media ID from WhatsApp
+                file_mime = file_data.get("mime_type", "")
+                log_task_event(emp_name, f"Sent {msg_type} file")
+
+                # Send confirmation to employee
+                whatsapp_send_text(
+                    sender,
+                    f"✅ {msg_type.capitalize()} received. Analyzing and forwarding to boss..."
+                )
+
+                if media_id:
+                    result = analyze_any_file(media_id, file_mime, sender_name)
+                    whatsapp_send_text(BOSS_WA_ID,
+                                       f"📎 From {emp_name}:\n{result}")
+                    whatsapp_send_text(
+                        sender,
+                        "✅ File analyzed and sent to boss successfully.")
+                    log_task_event(emp_name, f"File analyzed and sent to boss")
+                else:
+                    whatsapp_send_text(
+                        sender, "⚠️ Error processing file. Please try again.")
+                    whatsapp_send_text(
+                        BOSS_WA_ID, f"⚠️ No valid media ID for {emp_name}.")
+                return
+
+            # --- Text messages → AI auto reply with TTS decision
+            elif text and text not in [
+                    "[voice note]", "[image]", "[interactive reply]"
+            ]:
+                try:
+                    print("🚀 Triggering AI for message:", text)
+                    # Use LangChain memory-enabled AI reply
+                    ai_reply = get_reply_from_ai(emp_name,
+                                                 text,
+                                                 use_memory=True,
+                                                 mode="reply")
+
+                    # Send reply with TTS decision logic
+                    send_reply_with_tts_decision(sender,
+                                                 ai_reply,
+                                                 employee_name=emp_name)
+                    log_task_event(emp_name, f"Received AI reply")
+                except Exception as e:
+                    print(f"⚠️ AI auto-reply failed: {e}")
+                    # Send graceful error message to employee
+                    whatsapp_send_text(
+                        sender,
+                        "✅ Message received. Boss ko notify kar diya hai.")
+                    # Notify boss about the message and AI failure
+                    whatsapp_send_text(
+                        BOSS_WA_ID,
+                        f"📩 Message from {emp_name}:\n{text}\n\n⚠️ (AI auto-reply unavailable)"
+                    )
+
+        else:
+            # Unknown sender
+            print(f"⚠️ Unknown sender: {sender}")
+            whatsapp_send_text(
+                sender,
+                "Aap system me map nahi hain. Boss se 'map Name <number>' karwayen."
+            )
+            whatsapp_send_text(
+                BOSS_WA_ID,
+                f"🆕 New number {sender} ne message bheja. Map karne ke liye likhein:\nmap Name {sender}"
+            )
+
     except Exception as e:
         print(f"❌ Error in process_message: {e}")
+        whatsapp_send_text(BOSS_WA_ID, f"❌ Error processing message: {e}")
+
 
 def update_employee_chat(sender, msg_text):
     """placeholder for chat logging"""
     pass
 
+
 # Graceful shutdown: close DB engine if available
 @app.on_event("shutdown")
 async def _app_shutdown():
     try:
+        # Stop multi-agent system if running
+        enable_multi_agent = os.getenv("ENABLE_MULTI_AGENT",
+                                       "false").lower() == "true"
+        if enable_multi_agent and MULTI_AGENT_AVAILABLE:
+            await task_queue.stop()
+            print("✅ Multi-Agent System stopped")
+
         if close_engine:
             await close_engine()
     except Exception as e:
         print("Shutdown error:", e)
 
+
 # Note: legacy socketserver-based main() removed. Run the app with uvicorn:
 #    .venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000
-
-
-
-
-

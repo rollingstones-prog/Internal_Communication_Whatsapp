@@ -10,13 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine, AsyncSessio
 from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
 from sqlalchemy import Integer, String, Text, Boolean, DateTime, select, update
 from sqlalchemy.sql import func
-from dotenv import load_dotenv 
 
-# Load environment variables (Local testing ke liye)
-load_dotenv(override=True)
-
-# DATABASE_URL ko Environment Variable se load karein
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db") 
+DATABASE_URL = "sqlite+aiosqlite:///./what_agent.db"
 
 Base = declarative_base()
 engine: Optional[AsyncEngine] = None
@@ -24,7 +19,7 @@ SessionLocal: Optional[sessionmaker] = None
 
 
 # ───────────────────────────────────────────
-# MODELS (No changes here)
+# MODELS
 # ───────────────────────────────────────────
 class Employee(Base):
     __tablename__ = "employees"
@@ -32,8 +27,8 @@ class Employee(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     msisdn: Mapped[str] = mapped_column(String(32), nullable=False)
     pref: Mapped[str] = mapped_column(String(16),
-                                     nullable=False,
-                                     server_default="auto")
+                                      nullable=False,
+                                      server_default="auto")
     meta: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
@@ -46,8 +41,8 @@ class Task(Base):
     title: Mapped[Optional[str]] = mapped_column(String(256))
     details: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32),
-                                     nullable=False,
-                                     server_default="pending")
+                                        nullable=False,
+                                        server_default="pending")
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
 
@@ -55,19 +50,19 @@ class Task(Base):
 class WhatsAppInbox(Base):
     __tablename__ = "whatsapp_inbox"
     id: Mapped[int] = mapped_column(Integer,
-                                     primary_key=True,
-                                     autoincrement=True)
+                                    primary_key=True,
+                                    autoincrement=True)
     phone: Mapped[str] = mapped_column(String(32), nullable=False)
     message_text: Mapped[str] = mapped_column(Text, nullable=False)
     processed: Mapped[bool] = mapped_column(Boolean,
-                                         nullable=False,
-                                         server_default="false")
+                                            nullable=False,
+                                            server_default="false")
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
 
 
 # ───────────────────────────────────────────
-# CONNECTION + HELPERS (Only init_db changed)
+# CONNECTION + HELPERS
 # ───────────────────────────────────────────
 async def get_engine() -> AsyncEngine:
     global engine
@@ -81,29 +76,34 @@ async def get_session() -> AsyncSession:
     if SessionLocal is None:
         eng = await get_engine()
         SessionLocal = sessionmaker(bind=eng,
-                                     class_=AsyncSession,
-                                     expire_on_commit=False)
+                                    class_=AsyncSession,
+                                    expire_on_commit=False)
     return SessionLocal()
 
 
 async def init_db(migrate_employees_from: Path
-                 | None = Path("./employees.json")) -> None:
+                  | None = Path("./employees.json")) -> None:
     """Create tables and optionally migrate employees.json."""
     eng = await get_engine()
     try:
-        # 🛑 FIX: Sirf PostgreSQL se connect karein. No SQLite fallback.
         async with eng.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-    except Exception as e:
-        # Agar yahan error aaya, toh iska matlab hai ki Render Environment
-        # mein DATABASE_URL ghalat hai. Isko pakadna zaroori hai.
-        print(f"❌ CRITICAL ERROR: PostgreSQL initialization failed: {e}")
-        raise # Deployment ko fail hone dein
+    except Exception:
+        # Fallback to SQLite if Postgres unavailable
+        sqlite_url = "sqlite+aiosqlite:///./what_agent.db"
+        global engine
+        engine = create_async_engine(sqlite_url, echo=False, future=True)
+        global SessionLocal
+        SessionLocal = sessionmaker(bind=engine,
+                                    class_=AsyncSession,
+                                    expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
     # Optional migration of employees.json
     try:
         data = json.load(open(migrate_employees_from)
-                             ) if migrate_employees_from.exists() else {}
+                         ) if migrate_employees_from.exists() else {}
     except Exception:
         data = {}
 
@@ -114,7 +114,7 @@ async def init_db(migrate_employees_from: Path
             for name, val in data.items():
                 msisdn = val["msisdn"] if isinstance(val, dict) else val
                 pref = val.get("pref", os.getenv("DELIVERY_DEFAULT",
-                                                     "auto")) if isinstance(
+                                                 "auto")) if isinstance(
                                                      val, dict) else "auto"
                 session.add(Employee(name=name, msisdn=msisdn, pref=pref))
             await session.commit()
@@ -129,8 +129,7 @@ async def get_new_messages():
         return [{
             "inbox_id": r.id,
             "phone": r.phone,
-            "message_text": r.message_text,
-            "at": r.created_at 
+            "message_text": r.message_text
         } for r in rows]
 
 

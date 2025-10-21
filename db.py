@@ -10,14 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine, AsyncSessio
 from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
 from sqlalchemy import Integer, String, Text, Boolean, DateTime, select, update
 from sqlalchemy.sql import func
-from dotenv import load_dotenv # <-- Zaroori Import
+from dotenv import load_dotenv 
 
 # Load environment variables (Local testing ke liye)
 load_dotenv(override=True)
 
-# 🛑 CRITICAL FIX: DATABASE_URL ko Environment Variable se load karein
-# Agar DATABASE_URL set hai (PostgreSQL URL), toh woh use hoga.
-# Agar set nahi hai, toh yeh SQLite par fallback karega.
+# DATABASE_URL ko Environment Variable se load karein
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db") 
 
 Base = declarative_base()
@@ -26,7 +24,7 @@ SessionLocal: Optional[sessionmaker] = None
 
 
 # ───────────────────────────────────────────
-# MODELS
+# MODELS (No changes here)
 # ───────────────────────────────────────────
 class Employee(Base):
     __tablename__ = "employees"
@@ -69,12 +67,11 @@ class WhatsAppInbox(Base):
 
 
 # ───────────────────────────────────────────
-# CONNECTION + HELPERS
+# CONNECTION + HELPERS (Only init_db changed)
 # ───────────────────────────────────────────
 async def get_engine() -> AsyncEngine:
     global engine
     if engine is None:
-        # Ab yeh line Render Environment se PostgreSQL URL use karegi
         engine = create_async_engine(DATABASE_URL, echo=False, future=True)
     return engine
 
@@ -94,21 +91,14 @@ async def init_db(migrate_employees_from: Path
     """Create tables and optionally migrate employees.json."""
     eng = await get_engine()
     try:
-        # Postgres connection try karein
+        # 🛑 FIX: Sirf PostgreSQL se connect karein. No SQLite fallback.
         async with eng.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as e:
-        print(f"PostgreSQL connection/init failed. Falling back to SQLite: {e}")
-        # Agar Postgres unavailable, toh SQLite par fallback karein
-        sqlite_url = "sqlite+aiosqlite:///./what_agent.db"
-        global engine
-        engine = create_async_engine(sqlite_url, echo=False, future=True)
-        global SessionLocal
-        SessionLocal = sessionmaker(bind=engine,
-                                     class_=AsyncSession,
-                                     expire_on_commit=False)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        # Agar yahan error aaya, toh iska matlab hai ki Render Environment
+        # mein DATABASE_URL ghalat hai. Isko pakadna zaroori hai.
+        print(f"❌ CRITICAL ERROR: PostgreSQL initialization failed: {e}")
+        raise # Deployment ko fail hone dein
 
     # Optional migration of employees.json
     try:
@@ -136,7 +126,6 @@ async def get_new_messages():
         result = await session.execute(
             select(WhatsAppInbox).where(WhatsAppInbox.processed == False))
         rows = result.scalars().all()
-        # NOTE: dashboard_api.py ko 'created_at' ki zaroorat hai, isliye isko add kiya gaya hai.
         return [{
             "inbox_id": r.id,
             "phone": r.phone,

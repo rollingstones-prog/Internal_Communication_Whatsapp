@@ -1,6 +1,5 @@
 """
 Async SQLAlchemy PostgreSQL helper for the project
-— adds WhatsAppInbox model and message helpers.
 """
 from __future__ import annotations
 import os, json
@@ -10,23 +9,19 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine, AsyncSessio
 from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
 from sqlalchemy import Integer, String, Text, Boolean, DateTime, select, update
 from sqlalchemy.sql import func
-from dotenv import load_dotenv # <-- Import dotenv for local testing
+from dotenv import load_dotenv 
 
-# Load environment variables (Local testing ke liye)
 load_dotenv(override=True)
 
-# 🛑 CRITICAL FIX 1: DATABASE_URL ko Environment Variable se load karein.
-# Render par 'DATABASE_URL' set hoga. Local par default SQLite use hoga (agar zaroori ho).
+# DATABASE_URL ko Environment Variable se load karein.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./what_agent.db") 
 
 Base = declarative_base()
 engine: Optional[AsyncEngine] = None
 SessionLocal: Optional[sessionmaker] = None
 
+# ... (Employee, Task, WhatsAppInbox Models - No Change) ...
 
-# ───────────────────────────────────────────
-# MODELS (Wahi rakhe gaye hain)
-# ───────────────────────────────────────────
 class Employee(Base):
     __tablename__ = "employees"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -36,7 +31,6 @@ class Employee(Base):
     meta: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
-
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -48,7 +42,6 @@ class Task(Base):
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
 
-
 class WhatsAppInbox(Base):
     __tablename__ = "whatsapp_inbox"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -58,53 +51,42 @@ class WhatsAppInbox(Base):
     created_at: Mapped[Optional[DateTime]] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
 
-
 # ───────────────────────────────────────────
 # CONNECTION + HELPERS (init_db is fixed)
 # ───────────────────────────────────────────
 async def get_engine() -> AsyncEngine:
     global engine
     if engine is None:
-        # CRITICAL: Yahan DATABASE_URL variable use ho raha hai
         engine = create_async_engine(DATABASE_URL, echo=False, future=True)
     return engine
-
 
 async def get_session() -> AsyncSession:
     global SessionLocal
     if SessionLocal is None:
         eng = await get_engine()
-        SessionLocal = sessionmaker(bind=eng,
-                                     class_=AsyncSession,
-                                     expire_on_commit=False)
+        SessionLocal = sessionmaker(bind=eng, class_=AsyncSession, expire_on_commit=False)
     return SessionLocal()
-
 
 async def init_db(migrate_employees_from: Path
                  | None = Path("./employees.json")) -> None:
     """Create tables and optionally migrate employees.json."""
     eng = await get_engine()
     
-    # 🛑 CRITICAL FIX 2 & 3: Fallback logic hata diya gaya hai. Ab sirf PostgreSQL try hoga.
-    # Agar Render Environment mein DATABASE_URL set nahi hai, toh yeh code raise karega.
+    # CRITICAL FIX: SQLite Fallback hata diya gaya hai.
     try:
         async with eng.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as e:
-        # Ab agar PostgreSQL connect nahi hua toh server fail ho jayega.
-        # Tab humein pata chal jayega ki DATABASE_URL ghalat hai.
         print(f"❌ CRITICAL ERROR: Database initialization failed. Check DATABASE_URL: {e}")
-        raise # Deployment ko fail hone dein.
-
-    # Optional migration of employees.json
-    # ... (Employee migration logic wahi rakha gaya hai)
+        # Agar PostgreSQL connect na ho, toh server ko rukna hoga.
+        raise 
+    # ... (Employee migration logic wahi rakha gaya hai) ...
     try:
         data = json.load(open(migrate_employees_from)) if migrate_employees_from.exists() else {}
     except Exception:
         data = {}
 
     async with await get_session() as session:
-        # ... (Employee count aur insertion logic wahi rakha gaya hai)
         res = await session.execute(select(func.count()).select_from(Employee))
         count = res.scalar_one_or_none() or 0
         if count == 0 and data:
@@ -114,6 +96,7 @@ async def init_db(migrate_employees_from: Path
                 session.add(Employee(name=name, msisdn=msisdn, pref=pref))
             await session.commit()
 
+# ... (Baaki functions wahi hain: get_new_messages, mark_message_processed, close_engine) ...
 
 async def get_new_messages():
     """Return list of unprocessed WhatsApp messages."""
@@ -128,7 +111,6 @@ async def get_new_messages():
             "at": r.created_at # Add created_at for dashboard
         } for r in rows]
 
-
 async def mark_message_processed(inbox_id: int):
     """Mark message as processed."""
     async with await get_session() as session:
@@ -136,7 +118,6 @@ async def mark_message_processed(inbox_id: int):
             update(WhatsAppInbox).where(WhatsAppInbox.id == inbox_id).values(
                 processed=True))
         await session.commit()
-
 
 async def close_engine():
     global engine
